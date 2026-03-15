@@ -24,7 +24,7 @@ from .scoring import (
     SessionStats,
     RejectionFlags,
 )
-from .report import generate_csv_report, generate_html_report
+from .report import generate_csv_report, generate_html_report, generate_multi_filter_html_report
 from .cli import main
 
 __all__ = [
@@ -50,5 +50,6 @@ __all__ = [
     "RejectionFlags",
     "generate_csv_report",
     "generate_html_report",
+    "generate_multi_filter_html_report",
     "main",
 ]

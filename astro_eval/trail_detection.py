@@ -139,18 +139,34 @@ def _detect_components(
     binary = binary_dilation(binary, iterations=2)
 
     labeled, n_comps = label(binary)
-    if n_comps == 0 or n_comps > 2000:
-        if n_comps > 2000:
-            logger.warning("Trail detection: %d components (noisy image?); skipping.", n_comps)
+    if n_comps == 0:
+        return suppressed, []
+
+    # Fast size pre-filter via bincount.
+    # A trail spanning ≥15% of the downsampled diagonal (≥135 px) and ≥2 px wide
+    # after dilation has ≥270 pixels — nothing under 100 px can pass the shape
+    # filters.  This drops stars, noise spikes, and the many small nebula blobs
+    # common in OIII/Ha frames without touching genuine trail candidates.
+    sizes = np.bincount(labeled.ravel())          # sizes[i] = pixels with label i
+    significant_ids = np.where(sizes[1:] >= 100)[0] + 1  # 1-indexed; skip background
+    n_significant = len(significant_ids)
+
+    if n_significant == 0:
+        return suppressed, []
+
+    if n_significant > 200:
+        logger.debug(
+            "Trail detection: %d components, %d with ≥100 px "
+            "(complex nebula/star field?); skipping trail check.",
+            n_comps, n_significant,
+        )
         return suppressed, []
 
     components: List[_Component] = []
 
-    for idx in range(1, n_comps + 1):
+    for idx in significant_ids:
         mask = labeled == idx
-        n_pix = int(np.sum(mask))
-        if n_pix < 15:
-            continue
+        n_pix = int(sizes[idx])
 
         rows, cols = np.where(mask)
         coords = np.column_stack([rows.astype(np.float64),
