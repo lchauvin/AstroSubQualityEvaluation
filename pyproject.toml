@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astro-eval"
+version = "0.1.0"
+description = "Astrophotography sub-frame quality evaluation tool"
+requires-python = ">=3.9"
+dependencies = [
+    "astropy>=5.0",
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "sep>=1.2",
+    "matplotlib>=3.5",
+    "xisf>=0.9",
+]
+
+[project.scripts]
+astro-eval = "astro_eval.cli:main"

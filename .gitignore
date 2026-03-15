@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+uv.lock
+
+# Distribution / packaging
+*.whl
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checkers & linters
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Generated reports (project-specific)
+astro_eval_report.csv
+astro_eval_report.html
+
+# Astronomy data files — large, not source-controlled
+*.fits
+*.fit
+*.fts
+*.xisf
+*.raw
+
+# Rejected sub-frames directories
+_REJECTED/

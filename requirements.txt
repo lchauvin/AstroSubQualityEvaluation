@@ -1,0 +1,6 @@
+astropy>=5.0
+numpy>=1.21
+scipy>=1.7
+sep>=1.2
+matplotlib>=3.5
+xisf>=0.9
