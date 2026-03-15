@@ -2,7 +2,9 @@
 
 **Astrophotography sub-frame quality evaluation tool.**
 
-Evaluates directories of FITS files for quality metrics including PSF FWHM, star eccentricity, background noise, and signal-to-noise ratio. Produces composite quality scores and per-frame rejection decisions, with CSV and optional HTML reports.
+Evaluates directories of FITS/XISF files for quality metrics including PSF FWHM, star eccentricity, background noise, and signal-to-noise ratio. Produces composite quality scores and per-frame rejection decisions, with CSV and interactive HTML reports.
+
+Supports multi-filter sessions (Ha/OIII/SII) with per-filter tabbed reports, a live-updating watch mode, and optional remote file pull from an acquisition PC via SFTP.
 
 ## Equipment Support
 
@@ -14,7 +16,6 @@ Tuned for:
 ## Installation
 
 ```bash
-pip install -r requirements.txt
 pip install -e .
 ```
 
@@ -24,24 +25,32 @@ pip install -e .
 |---------|---------|
 | `astropy` | FITS I/O, sigma-clipped statistics |
 | `numpy` | Array operations |
-| `scipy` | PSF curve fitting (Moffat/Gaussian) |
+| `scipy` | PSF curve fitting (Moffat/Gaussian), trail detection |
 | `sep` | Source Extractor Python — star detection & background |
 | `matplotlib` | Distribution plots in HTML report |
+| `xisf` | XISF file format support |
+| `paramiko` | SFTP remote file pull (`--remote`) |
 
 ## Quick Start
 
 ```bash
-# Evaluate a session directory (auto-detects filter mode)
-astro-eval /path/to/session --html
+# Single filter session — generates CSV report
+astro-eval /path/to/ha_session
 
-# Narrowband Ha session with explicit mode
-astro-eval /path/to/ha_session --mode gas --html
+# With interactive HTML report
+astro-eval /path/to/ha_session --html
 
-# Broadband with custom thresholds
-astro-eval /path/to/lum --fwhm-threshold 4.0 --ecc-threshold 0.4
+# Multi-filter session (subdirs named Ha/, OIII/, SII/ etc.)
+astro-eval /path/to/session_root --html
 
-# Custom telescope
-astro-eval /path/to/session --focal-length 600
+# Live watch mode — updates report every 30s as new frames arrive
+astro-eval /path/to/session --watch --html
+
+# Watch + pull new frames from a remote acquisition PC via SFTP
+astro-eval ./staging --watch --html \
+  --remote astromini \
+  --remote-dir "C:\Users\AstroMini\Documents\N.I.N.A\2026-03-09\Soul Nebula\LIGHT" \
+  --remote-user AstroMini
 ```
 
 ## Processing Modes
@@ -56,12 +65,69 @@ astro-eval /path/to/session --focal-length 600
 
 | Filter keyword | Canonical | Mode |
 |----------------|-----------|------|
-| `Ha`, `H-Alpha`, `H_Alpha`, `HAlpha` | `Ha` | gas |
-| `OIII`, `O3`, `O-III` | `OIII` | gas |
-| `SII`, `S2`, `S-II` | `SII` | gas |
+| `Ha`, `H-Alpha`, `H`, `HAlpha` | `Ha` | gas |
+| `OIII`, `O3`, `O-III`, `O` | `OIII` | gas |
+| `SII`, `S2`, `S-II`, `S` | `SII` | gas |
 | `R`, `Red`, `G`, `Green`, `B`, `Blue` | R/G/B | star |
 | `L`, `Lum`, `Luminance` | L | star |
 | Unknown / missing | — | star (with warning) |
+
+## Multi-Filter Mode
+
+If `INPUT_DIR` contains subdirectories with filter names (e.g. `Ha/`, `OIII/`, `SII/`), the tool automatically processes each filter independently with its own session statistics and rejection thresholds, and generates a single tabbed HTML report.
+
+```
+session_root/
+├── Ha/        ← processed as gas mode
+├── OIII/      ← processed as gas mode
+└── SII/       ← processed as gas mode
+```
+
+Each filter's CSV is written as `astro_eval_report_Ha.csv`, `astro_eval_report_OIII.csv`, etc.
+
+## Watch Mode
+
+```bash
+astro-eval /path/to/session --watch --html
+```
+
+- Polls for new FITS/XISF files every 30 seconds
+- Re-evaluates session statistics and regenerates the report when new frames arrive
+- Serves the report at `http://127.0.0.1:7420/` and auto-refreshes the browser via SSE
+- Press `Ctrl+C` to stop
+
+## Remote Pull (SFTP)
+
+Pull frames from a remote Windows acquisition PC during a live session:
+
+```bash
+astro-eval ./staging --watch --html \
+  --remote HOSTNAME_OR_IP \
+  --remote-dir "C:\path\to\LIGHT" \
+  --remote-user USERNAME \
+  --remote-key ~/.ssh/id_ed25519   # optional, auto-discovers ~/.ssh/ keys
+```
+
+- `INPUT_DIR` is the local staging directory where files are downloaded
+- Remote filter subdirectories (e.g. `LIGHT\H\`, `LIGHT\S\`, `LIGHT\O\`) are auto-detected via SFTP
+- The SSH connection is established once at startup and reused across polls
+- Starting with an empty staging directory is fine — the tool waits for the first SFTP pull
+
+### SSH key setup (one-time)
+
+On the evaluation PC:
+```bash
+ssh-keygen -t ed25519 -C "astro-eval"
+```
+
+On the acquisition PC (if the user is an Administrator, the standard `authorized_keys` location is ignored — use the admin file instead):
+```powershell
+# Copy public key to the admin-specific location
+Copy-Item "$env:USERPROFILE\.ssh\authorized_keys" "C:\ProgramData\ssh\administrators_authorized_keys"
+
+# Fix permissions
+icacls "C:\ProgramData\ssh\administrators_authorized_keys" /inheritance:r /grant:r "SYSTEM:F" /grant:r "BUILTIN\Administrators:F"
+```
 
 ## CLI Reference
 
@@ -73,7 +139,7 @@ astro-eval INPUT_DIR [OPTIONS]
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `INPUT_DIR` | *(required)* | Directory containing `.fits`, `.fit`, or `.fts` files |
+| `INPUT_DIR` | *(required)* | Directory with FITS/XISF files, filter subdirs, or local staging path |
 
 ### Options
 
@@ -90,19 +156,28 @@ astro-eval INPUT_DIR [OPTIONS]
 | `--sigma-noise SIGMA` | `2.5` | Sigma multiplier for noise statistical rejection |
 | `--sigma-bg SIGMA` | `3.0` | Sigma multiplier for background level rejection |
 | `--detection-threshold SIGMA` | `5.0` | Star detection sigma threshold |
+| `--workers N` | `1` | Parallel worker processes for frame evaluation |
 | `--html` | off | Generate HTML report with plots |
+| `--serve` | off | Serve the HTML report at `http://127.0.0.1:7420/` |
+| `--port PORT` | `7420` | HTTP server port |
+| `--watch` | off | Watch for new frames and update report every 30s (implies `--serve`) |
+| `--remote HOST` | — | Hostname/IP of remote acquisition PC for SFTP pull |
+| `--remote-dir DIR` | — | Remote directory to pull frames from (Windows paths OK) |
+| `--remote-user USER` | current user | SSH username for remote |
+| `--remote-key PATH` | auto | SSH private key path (auto-discovers `~/.ssh/` keys if omitted) |
+| `--local-staging DIR` | `INPUT_DIR` | Local directory for downloaded remote files |
 | `--verbose` | off | Verbose progress output |
 | `--version` | — | Show version and exit |
 
 ## Output
 
-### CSV report (`astro_eval_report.csv`)
+### CSV report
 
-One row per frame. Columns include:
+One file per filter: `astro_eval_report.csv` (single filter) or `astro_eval_report_Ha.csv` etc. (multi-filter).
 
 | Column | Description |
 |--------|-------------|
-| `filename` | FITS filename |
+| `filename` | FITS/XISF filename |
 | `mode` | `star` or `gas` |
 | `filter` | Filter name from header |
 | `exptime_s` | Exposure time (seconds) |
@@ -117,20 +192,23 @@ One row per frame. Columns include:
 | `rejection_reasons` | Pipe-separated rejection criterion names |
 | `flag_*` | Per-criterion binary rejection flags |
 
-### HTML report (`astro_eval_report.html`)
+### HTML report
 
 Self-contained HTML file (no external dependencies) including:
 - Summary cards (total/accepted/rejected/pass rate)
-- Per-criterion rejection breakdown table
+- Per-criterion rejection breakdown
 - Distribution plots: FWHM, star count, quality score, background noise
-- Color-coded per-frame results table (green/yellow/red)
-- Session statistics table
+- Color-coded per-frame results table with sortable columns
+- Clickable filename previews (asinh-stretched image)
+- "Move to _REJECTED" button with downloadable `.bat` script
+- Multi-filter: tabbed layout with a cross-filter Summary tab
+- Live auto-refresh via SSE when running in watch mode
 
 ## Metrics Explained
 
 ### Star Mode (Broadband)
 
-**FWHM** — Full Width at Half Maximum of the stellar PSF, fitted using a Moffat profile (Gaussian fallback). Measured in pixels, reported in arcseconds. Lower is better (sharper stars).
+**FWHM** — Full Width at Half Maximum of the stellar PSF, fitted using a Moffat profile (Gaussian fallback). Measured in pixels, reported in arcseconds. Lower is better.
 
 **Eccentricity** — Departure from circular PSF: `sqrt(1 - (b/a)²)`. 0 = perfect circle, approaching 1 = elongated. Caused by tracking errors, wind, or collimation issues.
 
@@ -140,7 +218,7 @@ Self-contained HTML file (no external dependencies) including:
 
 ### Gas Mode (Narrowband)
 
-**SNR Estimate** — `(signal_region_median - background_median) / background_rms`, where signal pixels are identified by sigma-clipping above background. Higher is better.
+**SNR Estimate** — `(signal_region_median - background_median) / background_rms`. Higher is better.
 
 **Background RMS** — Noise level of the sky background. Higher values indicate light pollution, moon contamination, or sky glow.
 
@@ -158,7 +236,7 @@ Score = 0.30×(1 - norm_FWHM) + 0.25×(1 - norm_Ecc) + 0.20×norm_Stars + 0.25×
 Score = 0.40×norm_SNR + 0.25×(1 - norm_Noise) + 0.15×(1 - norm_BG) + 0.20×norm_Stars
 ```
 
-All metrics are normalized to [0, 1] across the session range. Score of 1.0 is the best frame in the session.
+All metrics are normalized to [0, 1] across the session. Score of 1.0 is the best frame in the session. Statistics are computed **independently per filter** in multi-filter mode.
 
 ## Rejection Criteria
 
@@ -182,26 +260,39 @@ All metrics are normalized to [0, 1] across the session range. Score of 1.0 is t
 
 > **Note:** Gradients and vignetting are intentionally **not** rejection criteria — these are correctable in post-processing with calibration frames.
 
+## Trail Detection
+
+Satellite and airplane trails are detected automatically:
+
+| Trail type | Classification | Rejection |
+|------------|---------------|-----------|
+| Satellite | Single thin trail, uniform brightness | Borderline (flagged, not rejected) |
+| Airplane | Double contrail or strobe pattern | Hard rejected |
+
+Detection uses PCA on connected components in a downsampled, background-suppressed image, followed by perpendicular cross-section analysis to distinguish single vs double trails.
+
 ## Technical Notes
 
-- **Minimum frames:** Session statistics require at least 3 frames for reliable thresholds. A warning is issued with fewer.
+- **Minimum frames:** Session statistics require at least 3 frames for reliable thresholds.
 - **Multi-extension FITS:** Automatically searches image extensions if primary HDU has no data.
 - **3D FITS arrays:** RGB (3×H×W) converted to luminance; multi-plane uses first plane.
+- **Existing report:** If a report already exists, the tool prompts before reprocessing.
 - **SEP byte order:** `byteswap().newbyteorder()` applied before all SEP calls as required.
 - **Saturated stars:** Skipped during PSF fitting (SEP flag bit 4).
-- **Edge sources:** Excluded within 50 px of image border by default.
+- **Edge sources:** Excluded within 50 px of image border.
 
 ## Architecture
 
 ```
 astro_eval/
 ├── __init__.py        Package exports
-├── fits_loader.py     FITS I/O + header parsing
+├── image_loader.py    FITS/XISF I/O + header parsing
 ├── background.py      Background estimation (SEP + sigma-clip)
 ├── star_detection.py  SEP star detection + quality filtering
 ├── psf_fitting.py     Moffat/Gaussian PSF fitting
 ├── metrics.py         Star + gas metric computation
+├── trail_detection.py Satellite/airplane trail detection
 ├── scoring.py         Session stats, rejection flags, composite scores
 ├── report.py          CSV + HTML report generation
-└── cli.py             argparse CLI entry point
+└── cli.py             CLI, HTTP server, watch loop, SFTP sync
 ```
