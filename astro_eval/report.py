@@ -55,6 +55,7 @@ CSV_COLUMNS = [
     "background_rms",
     "noise_mad",
     "background_gradient",
+    "altitude_deg",
     "score",
     "rejected",
     "rejection_reasons",
@@ -116,6 +117,7 @@ def _result_to_row(result: FrameResult) -> dict:
         "background_rms": _fmt(m.background_rms),
         "noise_mad": _fmt(m.noise_mad),
         "background_gradient": _fmt(m.background_gradient, precision=3),
+        "altitude_deg": _fmt(m.altitude_deg, precision=1) if m.altitude_deg is not None else "",
         "score": _fmt(result.score),
         "rejected": "1" if r.rejected else "0",
         "rejection_reasons": "|".join(r.rejection_reasons),
@@ -189,6 +191,7 @@ def _parse_obs_time(s: Optional[str]):
     return None
 
 
+
 def _plot_quality_trend(
     results: List[FrameResult],
     filter_name: str = "",
@@ -237,7 +240,7 @@ def _plot_quality_trend(
         if not finite_primary:
             return None
 
-        fig, ax1 = plt.subplots(figsize=(16, 4))
+        fig, ax1 = plt.subplots(figsize=(9, 4))
         ax2 = ax1.twinx()
 
         primary_color = "#5b9bd5"
@@ -247,13 +250,6 @@ def _plot_quality_trend(
         valid_xs = [x for x, v in zip(xs, primary_vals) if math.isfinite(v)]
         valid_ys = [v for v in primary_vals if math.isfinite(v)]
         ax1.plot(valid_xs, valid_ys, color=primary_color, linewidth=1.2, zorder=2)
-
-        # Rejected frame markers
-        rej_xs = [x for x, v, r in zip(xs, primary_vals, rejected) if r and math.isfinite(v)]
-        rej_ys = [v for v, r in zip(primary_vals, rejected) if r and math.isfinite(v)]
-        if rej_xs:
-            ax1.scatter(rej_xs, rej_ys, color="#d9534f", s=35, zorder=5,
-                        label="Rejected")
 
         # Session median line
         med = float(np.nanmedian(finite_primary))
@@ -265,6 +261,13 @@ def _plot_quality_trend(
         valid_score_ys = [v for v in score_vals if math.isfinite(v)]
         ax2.plot(valid_score_xs, valid_score_ys, color=score_color,
                  linewidth=1.0, linestyle=":", zorder=3, label="Score")
+
+        # Rejected markers on the score curve
+        rej_xs = [x for x, v, r in zip(xs, score_vals, rejected) if r and math.isfinite(v)]
+        rej_ys = [v for v, r in zip(score_vals, rejected) if r and math.isfinite(v)]
+        if rej_xs:
+            ax2.scatter(rej_xs, rej_ys, color="#d9534f", s=35, zorder=5, label="Rejected")
+
         ax2.set_ylim(0, 1.05)
         ax2.set_ylabel("Quality Score", color=score_color, fontsize=9)
         ax2.tick_params(axis="y", labelcolor=score_color)
@@ -280,9 +283,16 @@ def _plot_quality_trend(
             fig.autofmt_xdate()
             ax1.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
 
+        # Legend: Rejected, Median, Score — Rejected and Score come from ax2, Median from ax1
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right")
+        # Reorder: Rejected (last of ax2), Median (ax1), Score (first of ax2)
+        combined = list(zip(lines2 + lines1, labels2 + labels1))
+        rej_entries   = [(h, l) for h, l in combined if l == "Rejected"]
+        other_entries = [(h, l) for h, l in combined if l != "Rejected"]
+        ordered_entries = rej_entries + other_entries
+        ax1.legend([h for h, _ in ordered_entries], [l for _, l in ordered_entries],
+                   fontsize=8, loc="upper right")
 
         plt.tight_layout()
         img = _make_plot_base64(fig)
@@ -290,6 +300,88 @@ def _plot_quality_trend(
         return img
     except Exception as exc:
         logger.warning("Failed to generate quality trend plot: %s", exc)
+        return None
+
+
+def _plot_score_vs_altitude(
+    results: List[FrameResult],
+) -> Optional[str]:
+    """
+    Dual-axis plot over frame index, consistent with _plot_quality_trend.
+    Left Y (blue):   altitude above horizon [°].
+    Right Y (orange dotted): quality score [0, 1].
+    Rejected frames marked with red scatter on the altitude line.
+    Legend order: Rejected, Altitude, Score.
+    Returns base64 PNG, or None if no altitude data is available.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        ordered = sorted(results, key=lambda r: r.metrics.filename)
+
+        has_altitude = any(r.metrics.altitude_deg is not None for r in ordered)
+        if not has_altitude:
+            return None
+
+        xs       = list(range(len(ordered)))
+        scores   = [r.score for r in ordered]
+        alts     = [r.metrics.altitude_deg for r in ordered]
+        rejected = [r.rejection.rejected for r in ordered]
+
+        alt_color   = "#5b9bd5"
+        score_color = "#f0ad4e"
+
+        fig, ax1 = plt.subplots(figsize=(9, 4))
+        ax2 = ax1.twinx()
+
+        # Altitude line (left axis)
+        valid_alt_xs = [x for x, a in zip(xs, alts) if a is not None]
+        valid_alts   = [a for a in alts if a is not None]
+        ax1.plot(valid_alt_xs, valid_alts, color=alt_color, linewidth=1.2, zorder=2, label="Altitude")
+
+        # Score line (right axis)
+        valid_score_xs = [x for x, s in zip(xs, scores) if math.isfinite(s)]
+        valid_scores   = [s for s in scores if math.isfinite(s)]
+        ax2.plot(valid_score_xs, valid_scores, color=score_color, linewidth=1.0,
+                 linestyle=":", zorder=3, label="Score")
+
+        # Rejected markers on the score curve
+        rej_xs   = [x for x, s, rj in zip(xs, scores, rejected) if rj and math.isfinite(s)]
+        rej_scores = [s for s, rj in zip(scores, rejected) if rj and math.isfinite(s)]
+        if rej_xs:
+            ax2.scatter(rej_xs, rej_scores, color="#d9534f", s=35, zorder=5, label="Rejected")
+
+        ax1.set_ylabel("Altitude (°)", color=alt_color, fontsize=9)
+        ax1.tick_params(axis="y", labelcolor=alt_color)
+        ax1.set_ylim(0, 92)
+        ax1.set_xlim(-0.5, len(ordered) - 0.5)
+        ax1.set_xlabel("Frame index", fontsize=9)
+
+        ax2.set_ylabel("Quality Score", color=score_color, fontsize=9)
+        ax2.tick_params(axis="y", labelcolor=score_color)
+        ax2.set_ylim(0, 1.05)
+
+        ax1.set_title("Score & Altitude", fontsize=10)
+        ax1.grid(axis="both", alpha=0.2)
+
+        # Legend order: Rejected, Altitude, Score
+        lines1, labels1 = ax1.get_legend_handles_labels()   # Altitude
+        lines2, labels2 = ax2.get_legend_handles_labels()   # Score, Rejected
+        combined = list(zip(lines2 + lines1, labels2 + labels1))
+        rej_entries   = [(h, l) for h, l in combined if l == "Rejected"]
+        other_entries = [(h, l) for h, l in combined if l != "Rejected"]
+        ordered_entries = rej_entries + other_entries
+        ax1.legend([h for h, _ in ordered_entries], [l for _, l in ordered_entries],
+                   fontsize=8, loc="upper right")
+
+        plt.tight_layout()
+        img = _make_plot_base64(fig)
+        plt.close(fig)
+        return img
+    except Exception as exc:
+        logger.warning("Failed to generate score vs altitude plot: %s", exc)
         return None
 
 
@@ -634,7 +726,8 @@ def generate_html_report(
     star_plot  = _plot_star_count_distribution(results)
     score_plot = _plot_score_distribution(results)
     bg_plot    = _plot_background_distribution(results)
-    trend_plot = _plot_quality_trend(results)
+    trend_plot    = _plot_quality_trend(results)
+    altitude_plot = _plot_score_vs_altitude(results)
 
     def img_tag(b64: Optional[str], alt: str) -> str:
         if b64 is None:
@@ -718,6 +811,7 @@ def generate_html_report(
             f"{_format_cell(m.background_rms, precision=1)}"
             f"{_format_cell(m.background_gradient, precision=2)}"
             f"{trail_cell}"
+            f"{_format_cell(m.altitude_deg, precision=1)}"
             f"{_format_cell(result.score)}"
             f"{status_cell}"
             f'<td data-value="{reasons_text}">{reasons_text}</td>'
@@ -882,13 +976,26 @@ def generate_html_report(
       <div class="card"><div class="value">{n_accepted/n_total*100:.1f}%</div><div>Pass Rate</div></div>
     </div>
 
-    <h3>Rejection Breakdown</h3>
-    <table class="flag-table">
-      <thead><tr><th>Criterion</th><th>Frames Flagged</th></tr></thead>
-      <tbody>{flag_rows}</tbody>
-    </table>
     <h3>Scoring</h3>
     {scoring_info}
+    <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:16px;align-items:stretch;">
+      <div style="flex:1;min-width:240px;background:white;border-radius:8px;padding:16px;box-shadow:0 2px 6px rgba(0,0,0,0.08);">
+        <h3 style="margin-top:0;margin-bottom:10px;">Rejection Breakdown</h3>
+        <table style="box-shadow:none;border-radius:0;">
+          <thead><tr><th>Criterion</th><th>Frames Flagged</th></tr></thead>
+          <tbody>{flag_rows}</tbody>
+        </table>
+      </div>
+      <div style="flex:3;min-width:420px;background:white;border-radius:8px;padding:16px;box-shadow:0 2px 6px rgba(0,0,0,0.08);overflow-x:auto;">
+        <h3 style="margin-top:0;margin-bottom:10px;">Session Statistics</h3>
+        <table style="box-shadow:none;border-radius:0;">
+          <thead>
+            <tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th><th>Rejection threshold</th></tr>
+          </thead>
+          <tbody>{"".join(stat_rows)}</tbody>
+        </table>
+      </div>
+    </div>
   </section>
 
   <section>
@@ -899,17 +1006,10 @@ def generate_html_report(
       <div class="plot-box"><h3>Quality Score</h3>{img_tag(score_plot, "Score Distribution")}</div>
       <div class="plot-box"><h3>Background Noise</h3>{img_tag(bg_plot, "Background Noise Distribution")}</div>
     </div>
-    <div class="plot-box" style="margin-top:20px"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
-  </section>
-
-  <section>
-    <h2>Session Statistics</h2>
-    <table class="session-table">
-      <thead>
-        <tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th><th>Rejection threshold</th></tr>
-      </thead>
-      <tbody>{"".join(stat_rows)}</tbody>
-    </table>
+    <div style="display:flex;gap:20px;margin-top:20px;flex-wrap:wrap;">
+      <div class="plot-box" style="flex:1;min-width:0;"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="max-width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
+      <div class="plot-box" style="flex:1;min-width:0;"><h3>Quality vs Altitude</h3>{img_tag(altitude_plot, "Quality vs Altitude")}</div>
+    </div>
   </section>
 
   <section>
@@ -955,6 +1055,7 @@ def generate_html_report(
           <th class="sortable">BG RMS</th>
           <th class="sortable" title="Background gradient in noise σ units: (max−min)/noise_rms across 8×8 sky cells. Typical: uniform ~5–30σ, LP ~20–80σ, burned >100σ.">Gradient σ</th>
           <th class="sortable">Trails</th>
+          <th class="sortable" title="Telescope altitude above horizon in degrees">Alt (°)</th>
           <th class="sortable">Score</th>
           <th class="sortable">Status</th>
           <th class="sortable">Reasons</th>
@@ -1216,7 +1317,8 @@ def _build_panel_html(
     star_plot  = _plot_star_count_distribution(results)
     score_plot = _plot_score_distribution(results)
     bg_plot    = _plot_background_distribution(results)
-    trend_plot = _plot_quality_trend(results, filter_name=fid)
+    trend_plot    = _plot_quality_trend(results, filter_name=fid)
+    altitude_plot = _plot_score_vs_altitude(results)
 
     def img_tag(b64: Optional[str], alt: str) -> str:
         if b64 is None:
@@ -1291,6 +1393,7 @@ def _build_panel_html(
             f"{_format_cell(m.background_rms, precision=1)}"
             f"{_format_cell(m.background_gradient, precision=2)}"
             f"{trail_cell}"
+            f"{_format_cell(m.altitude_deg, precision=1)}"
             f"{_format_cell(result.score)}"
             f"{status_cell}"
             f'<td data-value="{reasons_text}">{reasons_text}</td>'
@@ -1305,13 +1408,24 @@ def _build_panel_html(
     <div class="card rejected"><div class="value">{n_rejected}</div><div>Rejected</div></div>
     <div class="card"><div class="value">{pass_pct}%</div><div>Pass Rate</div></div>
   </div>
-  <h3>Rejection Breakdown</h3>
-  <table class="flag-table">
-    <thead><tr><th>Criterion</th><th>Flagged</th></tr></thead>
-    <tbody>{flag_rows}</tbody>
-  </table>
   <h3>Scoring</h3>
   {scoring_info}
+  <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:16px;align-items:stretch;">
+    <div style="flex:1;min-width:240px;background:white;border-radius:8px;padding:16px;box-shadow:0 2px 6px rgba(0,0,0,0.08);">
+      <h3 style="margin-top:0;margin-bottom:10px;">Rejection Breakdown</h3>
+      <table style="box-shadow:none;border-radius:0;">
+        <thead><tr><th>Criterion</th><th>Flagged</th></tr></thead>
+        <tbody>{flag_rows}</tbody>
+      </table>
+    </div>
+    <div style="flex:3;min-width:420px;background:white;border-radius:8px;padding:16px;box-shadow:0 2px 6px rgba(0,0,0,0.08);overflow-x:auto;">
+      <h3 style="margin-top:0;margin-bottom:10px;">Session Statistics</h3>
+      <table style="box-shadow:none;border-radius:0;">
+        <thead><tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th><th>Rejection threshold</th></tr></thead>
+        <tbody>{"".join(stat_rows)}</tbody>
+      </table>
+    </div>
+  </div>
   <h2>Distribution Plots</h2>
   <div class="plots-grid">
     <div class="plot-box"><h3>FWHM</h3>{img_tag(fwhm_plot, "FWHM")}</div>
@@ -1319,12 +1433,10 @@ def _build_panel_html(
     <div class="plot-box"><h3>Quality Score</h3>{img_tag(score_plot, "Score")}</div>
     <div class="plot-box"><h3>Background Noise</h3>{img_tag(bg_plot, "BG Noise")}</div>
   </div>
-  <div class="plot-box" style="margin-top:20px"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
-  <h2>Session Statistics</h2>
-  <table class="session-table">
-    <thead><tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th><th>Rejection threshold</th></tr></thead>
-    <tbody>{"".join(stat_rows)}</tbody>
-  </table>
+  <div style="display:flex;gap:20px;margin-top:20px;flex-wrap:wrap;">
+    <div class="plot-box" style="flex:1;min-width:0;"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="max-width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
+    <div class="plot-box" style="flex:1;min-width:0;"><h3>Quality vs Altitude</h3>{img_tag(altitude_plot, "Quality vs Altitude")}</div>
+  </div>
   <h2>Per-Frame Results</h2>
   <p>
     <span style="background:#e8f5e9;padding:2px 8px;border-radius:3px;">Green</span> = accepted &nbsp;
@@ -1368,6 +1480,7 @@ def _build_panel_html(
         <th class="sortable">BG RMS</th>
         <th class="sortable" title="Background gradient: (max−min)/median of the 2D sky background map. Values above threshold are rejected.">Gradient</th>
         <th class="sortable">Trails</th>
+        <th class="sortable" title="Telescope altitude above horizon in degrees">Alt (°)</th>
         <th class="sortable">Score</th>
         <th class="sortable">Status</th>
         <th class="sortable">Reasons</th>

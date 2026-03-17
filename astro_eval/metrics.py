@@ -131,6 +131,9 @@ class FrameMetrics:
     # Observation time (ISO-8601 string from DATE-OBS header, for trend charts)
     obs_time: Optional[str] = None
 
+    # Telescope altitude above horizon in degrees (0=horizon, 90=zenith)
+    altitude_deg: Optional[float] = None
+
     # Processing notes
     error: Optional[str] = None
     warnings: list = field(default_factory=list)
@@ -242,6 +245,7 @@ def compute_star_metrics(
         ccd_temp=fits_data.ccd_temp,
         pixel_scale=pixel_scale,
         obs_time=fits_data.obs_time,
+        altitude_deg=fits_data.altitude_deg,
     )
 
     # Step 1: Background estimation
@@ -366,6 +370,7 @@ def compute_gas_metrics(
         ccd_temp=fits_data.ccd_temp,
         pixel_scale=pixel_scale,
         obs_time=fits_data.obs_time,
+        altitude_deg=fits_data.altitude_deg,
     )
 
     # Step 1: Background estimation

@@ -87,6 +87,9 @@ class FITSData:
     # Observation time (ISO-8601 string from DATE-OBS header)
     obs_time: Optional[str] = None
 
+    # Telescope altitude above horizon in degrees (0=horizon, 90=zenith)
+    altitude_deg: Optional[float] = None
+
     # Image mode derived from filter
     mode: Optional[str] = None  # 'star' or 'gas'
 
@@ -122,6 +125,12 @@ def _parse_header(header) -> dict:
         "NAXIS", "NAXIS1", "NAXIS2", "NAXIS3",
         "BSCALE", "BZERO",
         "OBJECT", "DATE-OBS",
+        # Altitude / airmass
+        "ALTITUDE", "ALT", "OBJCTALT", "CENTALT", "AIRMASS",
+        # Site coordinates (for computing altitude from RA/DEC)
+        "RA", "DEC", "OBJCTRA", "OBJCTDEC",
+        "SITELAT", "SITELONG", "SITEELEV",
+        "OBSGEO-B", "OBSGEO-L",
     ]
     result = {}
     for k in keys:
@@ -161,6 +170,77 @@ def _extract_2d(data: np.ndarray) -> np.ndarray:
         logger.debug("Multi-plane FITS (%d planes), using first plane.", nplanes)
         return data[0].astype(np.float64)
     raise ValueError(f"Unexpected FITS data dimensions: {data.shape}")
+
+
+def _extract_altitude(header_dict: dict, obs_time: Optional[str]) -> Optional[float]:
+    """
+    Extract telescope altitude above horizon (degrees) from header metadata.
+
+    Tries in order:
+    1. Direct altitude keyword (ALTITUDE, ALT, OBJCTALT, CENTALT)
+    2. AIRMASS: altitude = arcsin(1 / airmass)
+    3. Compute from RA/DEC + DATE-OBS + site latitude/longitude via astropy
+
+    Returns altitude in degrees [0, 90], or None if unavailable.
+    """
+    import math
+
+    # 1. Direct altitude keyword
+    for key in ("ALTITUDE", "ALT", "OBJCTALT", "CENTALT"):
+        val = header_dict.get(key)
+        if val is not None:
+            try:
+                alt = float(val)
+                if -10.0 <= alt <= 90.0:   # sanity check
+                    return alt
+            except (ValueError, TypeError):
+                pass
+
+    # 2. AIRMASS → altitude
+    airmass_raw = header_dict.get("AIRMASS")
+    if airmass_raw is not None:
+        try:
+            am = float(airmass_raw)
+            if 1.0 <= am <= 20.0:
+                alt = math.degrees(math.asin(min(1.0, 1.0 / am)))
+                return round(alt, 2)
+        except (ValueError, TypeError):
+            pass
+
+    # 3. Compute from RA/DEC + site coordinates + time
+    ra_raw  = header_dict.get("RA")  or header_dict.get("OBJCTRA")
+    dec_raw = header_dict.get("DEC") or header_dict.get("OBJCTDEC")
+    lat_raw = header_dict.get("SITELAT") or header_dict.get("OBSGEO-B")
+    lon_raw = header_dict.get("SITELONG") or header_dict.get("OBSGEO-L")
+    time_str = obs_time
+
+    if ra_raw is not None and dec_raw is not None and lat_raw is not None \
+            and lon_raw is not None and time_str is not None:
+        try:
+            from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+            from astropy.time import Time
+            import astropy.units as u
+
+            # RA may be a sexagesimal string ("12 34 56.7") or float degrees
+            try:
+                ra_deg  = float(ra_raw)
+                dec_deg = float(dec_raw)
+                coord = SkyCoord(ra=ra_deg * u.degree, dec=dec_deg * u.degree)
+            except (ValueError, TypeError):
+                coord = SkyCoord(ra_raw, dec_raw, unit=(u.hourangle, u.degree))
+
+            lat_deg = float(lat_raw)
+            lon_deg = float(lon_raw)
+            location = EarthLocation(lat=lat_deg * u.degree, lon=lon_deg * u.degree)
+            obstime  = Time(time_str, format="isot" if "T" in str(time_str) else "iso")
+            altaz    = coord.transform_to(AltAz(obstime=obstime, location=location))
+            alt = float(altaz.alt.degree)
+            if -10.0 <= alt <= 90.0:
+                return round(alt, 2)
+        except Exception:
+            pass
+
+    return None
 
 
 def load_fits(
@@ -341,6 +421,8 @@ def load_fits(
         if raw_obs is not None:
             obs_time = str(raw_obs).strip()
 
+        altitude_deg = _extract_altitude(header_dict, obs_time)
+
         fits_data = FITSData(
             filepath=str(filepath),
             filename=filepath.name,
@@ -356,6 +438,7 @@ def load_fits(
             pixel_scale_arcsec=pixel_scale,
             is_calibrated=is_calibrated,
             obs_time=obs_time,
+            altitude_deg=altitude_deg,
             mode=mode,
             header=header_dict,
         )
@@ -593,6 +676,20 @@ def load_xisf(
     if obs_time:
         obs_time = obs_time.strip()
 
+    # Populate altitude-related keys into header_dict for _extract_altitude
+    for fits_key, xisf_key in [
+        ("RA",       "Observation:Center:RA"),
+        ("DEC",      "Observation:Center:Dec"),
+        ("SITELAT",  "Observation:Location:Latitude"),
+        ("SITELONG", "Observation:Location:Longitude"),
+    ]:
+        if fits_key not in header_dict:
+            val = _xisf_get(meta, xisf_key, cast=float)
+            if val is not None:
+                header_dict[fits_key] = val
+
+    altitude_deg = _extract_altitude(header_dict, obs_time)
+
     fits_data = FITSData(
         filepath=str(filepath),
         filename=filepath.name,
@@ -608,6 +705,7 @@ def load_xisf(
         pixel_scale_arcsec=pixel_scale,
         is_calibrated=is_calibrated,
         obs_time=obs_time,
+        altitude_deg=altitude_deg,
         mode=mode,
         header=header_dict,
     )
