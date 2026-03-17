@@ -134,6 +134,7 @@ def compute_session_statistics(
         "wfwhm",
         "moffat_beta",
         "snr_estimate",
+        "background_gradient",
     ]
 
     stats: Dict[str, SessionStats] = {}
@@ -268,13 +269,25 @@ def compute_rejection_flags(
         else:
             flags["high_residual"] = False
 
+    # Severe background gradient (sunrise, twilight, cloud edge) — applies to both modes.
+    # Uses session-relative sigma criterion (primary) + optional absolute hard cap.
+    gradient = frame_metrics.background_gradient
+    grad_rejected = False
+    if math.isfinite(gradient):
+        s = stat("background_gradient")
+        if s.count > 0 and math.isfinite(s.median) and math.isfinite(s.std):
+            grad_rejected = gradient > s.median + config.sigma_gradient * s.std
+        if config.gradient_threshold > 0:
+            grad_rejected = grad_rejected or (gradient > config.gradient_threshold)
+    flags["high_gradient"] = grad_rejected
+
     # Trail detection applies regardless of mode.
     # Airplane trails are hard-rejected; satellite trails are informational only.
     flags["airplane_trail"]  = frame_metrics.trail_type == "airplane"
     flags["satellite_trail"] = frame_metrics.trail_type in ("satellite", "unknown")
 
     # satellite_trail and high_residual are informational — never cause rejection on their own
-    _soft_flags = {"satellite_trail", "high_residual"}
+    _soft_flags = {"satellite_trail", "high_residual"}  # high_gradient is a hard flag
     rejected = any(v for k, v in flags.items() if k not in _soft_flags)
     return RejectionFlags(
         filename=frame_metrics.filename,
@@ -286,6 +299,43 @@ def compute_rejection_flags(
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
+
+def _gradient_multiplier(
+    gradient: float,
+    s: SessionStats,
+    knee: float = 1.2,
+    strength: float = 1.0,
+) -> float:
+    """
+    Multiplicative gradient penalty applied after base score computation.
+
+    Works like trail penalties: a bad gradient crushes the entire score
+    regardless of how good FWHM/SNR/etc. are.  The additive approach only
+    nudged the score by ≤0.15; the multiplicative approach can reduce it to
+    near zero for severely burned frames.
+
+    multiplier = 1.0               when gradient ≤ knee × session_median
+    multiplier = exp(-strength × excess_ratio)  above the knee
+                                   where excess_ratio = (gradient/median) - knee
+
+    With strength=1.0 and knee=1.2:
+      gradient = 1.5× median  → multiplier ≈ 0.74  (mild penalty)
+      gradient = 2.0× median  → multiplier ≈ 0.45
+      gradient = 3.0× median  → multiplier ≈ 0.17
+      gradient = 4.0× median  → multiplier ≈ 0.07  (near-zero)
+    """
+    if not math.isfinite(gradient) or s.count == 0:
+        return 1.0
+    if not math.isfinite(s.median) or s.median <= 0:
+        return 1.0
+
+    ratio = gradient / s.median
+    if ratio <= knee:
+        return 1.0
+
+    excess = ratio - knee
+    return float(max(0.05, math.exp(-strength * excess)))
+
 
 def _normalize(value: float, min_val: float, max_val: float) -> float:
     """
@@ -305,16 +355,19 @@ def compute_star_score(
     metrics: FrameMetrics,
     session_stats: Dict[str, SessionStats],
     weights: Optional[ScoringWeights] = None,
+    config: Optional[EvalConfig] = None,
 ) -> float:
     """
     Compute composite quality score for a broadband frame.
 
-    Score = w_fwhm*(1-norm_fwhm) + w_ecc*(1-norm_ecc) + w_stars*norm_stars
-          + w_psfsw*norm_psfsw
+    Score = w_fwhm*(1-norm_fwhm) + w_ecc*(1-norm_ecc) + w_stars*norm_stars + w_psfsw*norm_psfsw
 
     snr_weight is retained in the CSV/HTML output for reference but has a
     default weight of 0.0 — PSFSignalWeight supersedes it because it already
     incorporates the amplitude/noise ratio plus a 1/FWHM² correction.
+
+    A gradient multiplier is applied in compute_score() after this base score,
+    similar to trail penalties.
 
     All metrics are normalized to [0, 1] across the session range.
     """
@@ -336,7 +389,7 @@ def compute_star_score(
         w.star_fwhm  * (1.0 - norm_fwhm)
         + w.star_ecc   * (1.0 - norm_ecc)
         + w.star_stars * norm_stars
-        + w.star_snr   * norm_snr       # 0.0 by default; configurable for back-compat
+        + w.star_snr   * norm_snr          # 0.0 by default; configurable for back-compat
         + w.star_psfsw * norm_psfsw
     )
     return float(np.clip(score, 0.0, 1.0))
@@ -346,6 +399,7 @@ def compute_gas_score(
     metrics: FrameMetrics,
     session_stats: Dict[str, SessionStats],
     weights: Optional[ScoringWeights] = None,
+    config: Optional[EvalConfig] = None,
 ) -> float:
     """
     Compute composite quality score for a narrowband frame.
@@ -391,6 +445,7 @@ def compute_score(
     metrics: FrameMetrics,
     session_stats: Dict[str, SessionStats],
     weights: Optional[ScoringWeights] = None,
+    config: Optional[EvalConfig] = None,
 ) -> float:
     """
     Compute composite quality score, then apply trail penalty.
@@ -399,12 +454,23 @@ def compute_score(
     among frames of the same trail type.
     """
     if metrics.mode == "gas":
-        base = compute_gas_score(metrics, session_stats, weights)
+        base = compute_gas_score(metrics, session_stats, weights, config)
     else:
-        base = compute_star_score(metrics, session_stats, weights)
+        base = compute_star_score(metrics, session_stats, weights, config)
 
-    multiplier = _TRAIL_PENALTY.get(metrics.trail_type, 1.0)
-    return float(np.clip(base * multiplier, 0.0, 1.0))
+    trail_multiplier = _TRAIL_PENALTY.get(metrics.trail_type, 1.0)
+
+    gradient_mult = _gradient_multiplier(
+        metrics.background_gradient,
+        session_stats.get("background_gradient", SessionStats(
+            "background_gradient", 0, float("nan"), float("nan"), float("nan"),
+            float("nan"), float("nan"),
+        )),
+        knee=config.gradient_knee if config else 1.2,
+        strength=weights.gradient_penalty_strength if weights else 1.0,
+    )
+
+    return float(np.clip(base * trail_multiplier * gradient_mult, 0.0, 1.0))
 
 
 @dataclass
@@ -437,11 +503,16 @@ def evaluate_session(
     """
     session_stats = compute_session_statistics(all_metrics)
 
+    min_score = config.min_score if config else 0.0
+
     results: List[FrameResult] = []
     for m in all_metrics:
         rejection = compute_rejection_flags(m, session_stats, config)
-        score = compute_score(m, session_stats, weights)
+        score = compute_score(m, session_stats, weights, config)
         rejection.score = score
+        if min_score > 0 and math.isfinite(score) and score < min_score:
+            rejection.flags["low_score"] = True
+            rejection.rejected = True
         results.append(FrameResult(metrics=m, rejection=rejection, score=score))
 
     accepted = sum(1 for r in results if not r.rejection.rejected)

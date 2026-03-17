@@ -54,6 +54,7 @@ CSV_COLUMNS = [
     "background_median",
     "background_rms",
     "noise_mad",
+    "background_gradient",
     "score",
     "rejected",
     "rejection_reasons",
@@ -68,6 +69,7 @@ CSV_COLUMNS = [
     "flag_low_stars",
     "flag_low_snr_weight",
     "flag_high_residual",
+    "flag_high_gradient",
     "flag_high_noise",
     "flag_high_background",
     "flag_low_snr",
@@ -113,6 +115,7 @@ def _result_to_row(result: FrameResult) -> dict:
         "background_median": _fmt(m.background_median),
         "background_rms": _fmt(m.background_rms),
         "noise_mad": _fmt(m.noise_mad),
+        "background_gradient": _fmt(m.background_gradient, precision=3),
         "score": _fmt(result.score),
         "rejected": "1" if r.rejected else "0",
         "rejection_reasons": "|".join(r.rejection_reasons),
@@ -126,6 +129,7 @@ def _result_to_row(result: FrameResult) -> dict:
         "flag_low_stars": "1" if r.flags.get("low_stars") else "0",
         "flag_low_snr_weight": "1" if r.flags.get("low_snr_weight") else "0",
         "flag_high_residual": "1" if r.flags.get("high_residual") else "0",
+        "flag_high_gradient": "1" if r.flags.get("high_gradient") else "0",
         "flag_high_noise": "1" if r.flags.get("high_noise") else "0",
         "flag_high_background": "1" if r.flags.get("high_background") else "0",
         "flag_low_snr": "1" if r.flags.get("low_snr") else "0",
@@ -494,7 +498,8 @@ def _scoring_info_html(results: List[FrameResult], weights: Optional[ScoringWeig
         desc = (
             "Optimised for faint emission nebulae. snr_estimate and background_rms are the primary "
             "quality discriminators. psf_signal_weight adds a star-sharpness bonus. "
-            "n_stars is used as a sky-transparency proxy."
+            "A multiplicative gradient penalty is applied after scoring "
+            "(like trail penalties) — see gradient_knee in config."
         )
     else:
         mode_label = "Star / Broadband"
@@ -512,7 +517,9 @@ def _scoring_info_html(results: List[FrameResult], weights: Optional[ScoringWeig
             terms.append(f'<span class="eq-term">{w.star_snr:.2f} × norm(snr_weight)</span>')
         desc = (
             "Optimised for broadband / RGB imaging. psf_signal_weight combines star amplitude, "
-            "noise, and fwhm² in one metric. fwhm_median adds an independent linear seeing penalty."
+            "noise, and fwhm² in one metric. fwhm_median adds an independent linear seeing penalty. "
+            "A multiplicative gradient penalty is applied after scoring "
+            "(like trail penalties) — see gradient_knee in config."
         )
 
     total_w = sum([
@@ -669,6 +676,7 @@ def generate_html_report(
             f"{_format_cell(m.moffat_beta, precision=2)}"
             f"{_format_cell(m.snr_estimate)}"
             f"{_format_cell(m.background_rms, precision=1)}"
+            f"{_format_cell(m.background_gradient, precision=2)}"
             f"{trail_cell}"
             f"{_format_cell(result.score)}"
             f"{status_cell}"
@@ -896,6 +904,7 @@ def generate_html_report(
           <th class="sortable" title="Moffat beta: atmospheric seeing index (typical 2.5–5)">β</th>
           <th class="sortable">SNR est</th>
           <th class="sortable">BG RMS</th>
+          <th class="sortable" title="Background gradient in noise σ units: (max−min)/noise_rms across 8×8 sky cells. Typical: uniform ~5–30σ, LP ~20–80σ, burned >100σ.">Gradient σ</th>
           <th class="sortable">Trails</th>
           <th class="sortable">Score</th>
           <th class="sortable">Status</th>
@@ -1221,6 +1230,7 @@ def _build_panel_html(
             f"{_format_cell(m.moffat_beta, precision=2)}"
             f"{_format_cell(m.snr_estimate)}"
             f"{_format_cell(m.background_rms, precision=1)}"
+            f"{_format_cell(m.background_gradient, precision=2)}"
             f"{trail_cell}"
             f"{_format_cell(result.score)}"
             f"{status_cell}"
@@ -1297,6 +1307,7 @@ def _build_panel_html(
         <th class="sortable" title="Moffat beta: atmospheric seeing index (typical 2.5–5)">β</th>
         <th class="sortable">SNR est</th>
         <th class="sortable">BG RMS</th>
+        <th class="sortable" title="Background gradient: (max−min)/median of the 2D sky background map. Values above threshold are rejected.">Gradient</th>
         <th class="sortable">Trails</th>
         <th class="sortable">Score</th>
         <th class="sortable">Status</th>

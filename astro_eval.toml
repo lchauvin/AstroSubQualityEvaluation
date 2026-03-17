@@ -51,14 +51,10 @@ sigma_residual = 3.0             # flag if PSF residual > session_median + sigma
                                  # (informational only — does not cause rejection by itself)
 sigma_gradient     = 2.0          # reject if gradient > session_median + sigma × std
 gradient_threshold = 0.0         # hard cap: reject if gradient > this value (0 = disabled)
-gradient_knee      = 1.2         # scoring knee: multiplicative penalty steepens above knee × session_median gradient
-                                 # lower values (e.g. 1.0) start penalising sooner; higher (e.g. 1.5) later
-min_score          = 0.5         # reject if composite score < this value (0 = disabled)
-                                 # catches frames where no single metric crosses its threshold but overall
-                                 # quality is poor (e.g. gradient multiplier crushing the score)
                                  # (max-min)/noise_rms across 8×8 grid of sigma-clipped sky cells
-                                 # captures sunrise, twilight, cloud edges burning part of the frame
-                                 # typical values: uniform sky ~5–30σ, LP gradient ~20–80σ, burned ~100–1000σ
+                                 # typical values: uniform sky ~5–30σ, LP ~20–80σ, burned ~100–1000σ
+gradient_knee      = 1.2         # scoring knee: multiplicative penalty steepens above knee × session_median gradient
+min_score          = 0.5         # reject if composite score < this value (0 = disabled)
 
 
 # ---------------------------------------------------------------------------

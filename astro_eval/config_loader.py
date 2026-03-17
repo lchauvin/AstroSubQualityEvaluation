@@ -20,7 +20,7 @@ Example config (all fields optional):
     [processing]
     mode = "auto"             # "star" | "gas" | "auto"
     detection_threshold = 5.0
-    workers = 1
+    workers = 0
 
     [rejection]
     fwhm_threshold_arcsec = 5.0
@@ -31,20 +31,22 @@ Example config (all fields optional):
     sigma_noise = 2.5
     sigma_bg = 3.0
     sigma_residual = 3.0
+    sigma_gradient = 2.0
+    gradient_threshold = 0.0
+    gradient_knee = 1.2
 
     [scoring.star]
-    weight_fwhm  = 0.25
-    weight_ecc   = 0.20
-    weight_stars = 0.15
-    weight_snr   = 0.15
-    weight_psfsw = 0.25
+    weight_fwhm     = 0.30
+    weight_ecc      = 0.25
+    weight_stars    = 0.20
+    weight_psfsw    = 0.25
 
     [scoring.gas]
-    weight_snr   = 0.30
-    weight_noise = 0.20
-    weight_bg    = 0.15
-    weight_stars = 0.20
-    weight_psfsw = 0.15
+    weight_snr      = 0.30
+    weight_noise    = 0.20
+    weight_bg       = 0.15
+    weight_stars    = 0.20
+    weight_psfsw    = 0.15
 
     [output]
     html    = false

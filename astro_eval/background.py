@@ -25,6 +25,7 @@ class BackgroundStats:
     background_rms: float    # standard deviation of background
     noise_mad: float         # MAD-based noise: 1.4826 * MAD
     background_map: Optional[np.ndarray] = None  # 2D background model (from SEP)
+    background_gradient: float = float("nan")    # (max-min)/median of 2D bg map; measures spatial non-uniformity
 
     @property
     def snr_proxy(self) -> float:
@@ -39,6 +40,72 @@ def _mad(data: np.ndarray) -> float:
     flat = data.ravel()
     med = np.median(flat)
     return float(np.median(np.abs(flat - med)))
+
+
+def _compute_background_gradient(image: np.ndarray, n_cells: int = 8) -> float:
+    """
+    Measure sky spatial non-uniformity by dividing the image into an n×n grid,
+    computing the sigma-clipped sky median of each cell, then expressing the
+    peak-to-valley variation in units of the per-pixel noise (σ).
+
+    Returns (max_cell_bg - min_cell_bg) / noise_rms.
+
+    Normalising by noise rather than by the sky median makes the metric
+    camera- and gain-independent: it directly answers "how many noise standard
+    deviations does the gradient span?"  This is critical because a gradient
+    that looks dramatic after stretching (where the sky level dominates the
+    denominator) may only be ~1 % of the sky ADU level but still hundreds of σ
+    above noise — and therefore genuinely damaging to the data.
+
+    This approach avoids SEP's background model, which sigma-clips bright
+    regions and can produce a spuriously flat map even when part of the image
+    is burned by sunrise or a cloud edge.
+
+    Typical values
+    --------------
+    Uniform sky / good night:        ~5–30 σ
+    Normal LP gradient (Bortle 9):   ~20–80 σ
+    Severe gradient (sunrise/cloud): ~100–1000+ σ
+    """
+    h, w = image.shape
+    cell_h = max(h // n_cells, 1)
+    cell_w = max(w // n_cells, 1)
+
+    cell_medians = []
+    all_noise: list = []
+
+    for i in range(n_cells):
+        for j in range(n_cells):
+            y0 = i * cell_h
+            y1 = min((i + 1) * cell_h, h)
+            x0 = j * cell_w
+            x1 = min((j + 1) * cell_w, w)
+            cell = image[y0:y1, x0:x1].ravel().astype(np.float64)
+            if len(cell) < 16:
+                continue
+            # Sigma-clip at 3σ to exclude stars and hot pixels
+            med = np.median(cell)
+            mad = float(np.median(np.abs(cell - med)))
+            sigma = 1.4826 * mad
+            if sigma > 0:
+                clipped = cell[np.abs(cell - med) < 3.0 * sigma]
+            else:
+                clipped = cell
+            if len(clipped) > 0:
+                cell_med = float(np.median(clipped))
+                cell_noise = 1.4826 * float(np.median(np.abs(clipped - cell_med)))
+                cell_medians.append(cell_med)
+                if cell_noise > 0:
+                    all_noise.append(cell_noise)
+
+    if len(cell_medians) < 2:
+        return float("nan")
+
+    noise_rms = float(np.median(all_noise)) if all_noise else 0.0
+    if noise_rms <= 0:
+        return float("nan")
+
+    return float((max(cell_medians) - min(cell_medians)) / noise_rms)
 
 
 def estimate_background_sigma_clip(
@@ -70,6 +137,7 @@ def estimate_background_sigma_clip(
 
     mad = _mad(image)
     noise_mad = 1.4826 * mad
+    gradient = _compute_background_gradient(image)
 
     return BackgroundStats(
         background_median=float(median),
@@ -77,6 +145,7 @@ def estimate_background_sigma_clip(
         background_rms=float(std),
         noise_mad=float(noise_mad),
         background_map=None,
+        background_gradient=gradient,
     )
 
 
@@ -118,18 +187,20 @@ def estimate_background_sep(
                          fw=filter_size, fh=filter_size)
 
     bg_map = bkg.back()
-    bkg_subtracted = data - bg_map
 
-    # Compute statistics on background-subtracted image
     mad = _mad(bg_map)
     noise_mad = 1.4826 * mad
 
+    bg_median = float(np.median(bg_map))
+    gradient = _compute_background_gradient(data)
+
     return BackgroundStats(
-        background_median=float(np.median(bg_map)),
+        background_median=bg_median,
         background_mean=float(np.mean(bg_map)),
         background_rms=float(bkg.globalrms),
         noise_mad=float(noise_mad),
         background_map=bg_map,
+        background_gradient=gradient,
     )
 
 

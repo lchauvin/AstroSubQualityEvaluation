@@ -304,10 +304,18 @@ Examples:
                         help="Sigma multiplier for background rejection. Default: 3.0")
     parser.add_argument("--sigma-residual", type=float, default=3.0, metavar="SIGMA",
                         help="Sigma multiplier for PSF residual flag (informational). Default: 3.0")
+    parser.add_argument("--sigma-gradient", type=float, default=2.0, metavar="SIGMA",
+                        help="Session-relative gradient rejection: reject if gradient > median + sigma × std. Default: 2.0")
+    parser.add_argument("--gradient-threshold", type=float, default=0.0, metavar="SIGMA",
+                        help="Absolute gradient rejection hard cap in noise σ units. 0 = disabled. Default: 0.")
+    parser.add_argument("--gradient-knee", type=float, default=1.2, metavar="RATIO",
+                        help="Gradient scoring knee: multiplier starts dropping above knee × session_median. Default: 1.2")
+    parser.add_argument("--min-score", type=float, default=0.5, metavar="SCORE",
+                        help="Reject frames with composite score below this value. 0 = disabled. Default: 0.5")
     parser.add_argument("--detection-threshold", type=float, default=5.0, metavar="SIGMA",
                         help="Star detection SNR threshold. Default: 5.0")
-    parser.add_argument("--workers", type=int, default=1, metavar="N",
-                        help="Parallel worker processes. 0 = all CPU cores. Default: 1.")
+    parser.add_argument("--workers", type=int, default=0, metavar="N",
+                        help="Parallel worker processes. 0 = all CPU cores. Default: 0.")
     parser.add_argument("--html", action="store_true", default=False,
                         help="Generate HTML report in addition to CSV.")
     parser.add_argument("--serve", action="store_true", default=False,
@@ -907,8 +915,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         "focal_length": 250.0, "fwhm_threshold": 5.0, "ecc_threshold": 0.5,
         "star_fraction": 0.7,  "snr_fraction": 0.5,   "sigma_fwhm": 2.0,
         "sigma_noise": 2.5,    "sigma_bg": 3.0,        "sigma_residual": 3.0,
+        "sigma_gradient": 2.0,
+        "gradient_threshold": 0.0,
+        "gradient_knee": 1.2,
+        "min_score": 0.5,
         "detection_threshold": 5.0,
-        "workers": 1,          "mode": "auto",         "html": False,
+        "workers": 0,          "mode": "auto",         "html": False,
         "serve": False,        "port": 7420,           "verbose": False,
     }
     _CFG_MAP = {
@@ -921,6 +933,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "sigma_noise":        "rejection.sigma_noise",
         "sigma_bg":           "rejection.sigma_bg",
         "sigma_residual":     "rejection.sigma_residual",
+        "sigma_gradient":     "rejection.sigma_gradient",
+        "gradient_threshold": "rejection.gradient_threshold",
+        "gradient_knee":      "rejection.gradient_knee",
+        "min_score":          "rejection.min_score",
         "detection_threshold":"processing.detection_threshold",
         "workers":            "processing.workers",
         "mode":               "processing.mode",
@@ -1062,6 +1078,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         sigma_noise=args.sigma_noise,
         sigma_bg=args.sigma_bg,
         sigma_residual=args.sigma_residual,
+        sigma_gradient=args.sigma_gradient,
+        gradient_threshold=args.gradient_threshold,
+        gradient_knee=args.gradient_knee,
+        min_score=args.min_score,
         mode=args.mode,
         verbose=args.verbose,
     )

@@ -43,11 +43,16 @@ class ScoringWeights:
     star_snr:   float = 0.00   # legacy SNR weight — kept for CSV/HTML output, not used in scoring
 
     # Gas / narrowband score weights
-    gas_snr:    float = 0.30   # reduced from 0.40; PSFSignalWeight captures much of the same signal
-    gas_noise:  float = 0.20   # reduced from 0.25
-    gas_bg:     float = 0.15
-    gas_stars:  float = 0.20
-    gas_psfsw:  float = 0.15   # PSFSignalWeight: amplitude×SNR×1/FWHM² — partial but useful in NB
+    gas_snr:   float = 0.30
+    gas_noise: float = 0.20
+    gas_bg:    float = 0.15
+    gas_stars: float = 0.20
+    gas_psfsw: float = 0.15
+
+    # Gradient multiplier steepness (applied post-scoring, like trail penalties)
+    # Controls how fast the multiplier drops above the knee.
+    # Higher = steeper penalty. Default 1.0 gives ~66% penalty at 2× median, ~30% at 3× median.
+    gradient_penalty_strength: float = 1.0
 
 
 @dataclass
@@ -75,6 +80,11 @@ class EvalConfig:
     mode: str = "auto"  # 'star', 'gas', or 'auto'
 
     sigma_residual: float = 3.0    # sigma for PSF residual statistical rejection
+    gradient_threshold: float = 0.0    # hard rejection: gradient in noise σ units; 0 = disabled (sigma_gradient used instead)
+    sigma_gradient:    float = 2.0    # session-relative rejection: reject if gradient > median + sigma × std
+    gradient_knee:     float = 1.2    # scoring knee: multiplier starts dropping above knee × session_median
+
+    min_score: float = 0.5             # reject if composite score < this value (0 = disabled)
 
     verbose: bool = False
 
@@ -96,6 +106,7 @@ class FrameMetrics:
     background_median: float = float("nan")
     background_rms: float = float("nan")
     noise_mad: float = float("nan")
+    background_gradient: float = float("nan")   # (max-min)/median of 2D bg map; >1.0 = severe gradient
 
     # Star metrics (star mode and partially gas mode)
     n_stars: int = 0
@@ -239,6 +250,7 @@ def compute_star_metrics(
         metrics.background_median = bg_stats.background_median
         metrics.background_rms = bg_stats.background_rms
         metrics.noise_mad = bg_stats.noise_mad
+        metrics.background_gradient = bg_stats.background_gradient
     except Exception as exc:
         logger.error("Background estimation failed for %s: %s", fits_data.filename, exc)
         metrics.error = f"Background estimation failed: {exc}"
@@ -362,6 +374,7 @@ def compute_gas_metrics(
         metrics.background_median = bg_stats.background_median
         metrics.background_rms = bg_stats.background_rms
         metrics.noise_mad = bg_stats.noise_mad
+        metrics.background_gradient = bg_stats.background_gradient
     except Exception as exc:
         logger.error("Background estimation failed for %s: %s", fits_data.filename, exc)
         metrics.error = f"Background estimation failed: {exc}"
