@@ -460,15 +460,20 @@ def compute_score(
 
     trail_multiplier = _TRAIL_PENALTY.get(metrics.trail_type, 1.0)
 
-    gradient_mult = _gradient_multiplier(
-        metrics.background_gradient,
-        session_stats.get("background_gradient", SessionStats(
-            "background_gradient", 0, float("nan"), float("nan"), float("nan"),
-            float("nan"), float("nan"),
-        )),
-        knee=config.gradient_knee if config else 1.2,
-        strength=weights.gradient_penalty_strength if weights else 1.0,
-    )
+    # Gradient penalty only applies to gas/narrowband mode.
+    # In star mode gradients are correctable in post-processing and should not affect the score.
+    if metrics.mode == "gas":
+        gradient_mult = _gradient_multiplier(
+            metrics.background_gradient,
+            session_stats.get("background_gradient", SessionStats(
+                "background_gradient", 0, float("nan"), float("nan"), float("nan"),
+                float("nan"), float("nan"),
+            )),
+            knee=config.gradient_knee if config else 1.2,
+            strength=weights.gradient_penalty_strength if weights else 1.0,
+        )
+    else:
+        gradient_mult = 1.0
 
     return float(np.clip(base * trail_multiplier * gradient_mult, 0.0, 1.0))
 
