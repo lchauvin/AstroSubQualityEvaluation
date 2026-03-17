@@ -164,16 +164,16 @@ def _detect_mode_from_filter(filter_name: Optional[str], verbose: bool = False) 
 def _process_frame(args_tuple: Tuple) -> Tuple:
     """
     Module-level worker for parallel frame processing.
-    args_tuple: (fpath, focal_length_mm, mode_arg, config)
+    args_tuple: (fpath, focal_length_mm, pixel_size_um, mode_arg, config)
     Returns: (FrameMetrics | None, filename_str, error_str | None)
     """
-    fpath, focal_length_mm, mode_arg, config = args_tuple
+    fpath, focal_length_mm, pixel_size_um, mode_arg, config = args_tuple
 
     from .image_loader import load_image
     from .metrics import compute_metrics
 
     try:
-        fits_data = load_image(fpath, focal_length_mm=focal_length_mm)
+        fits_data = load_image(fpath, focal_length_mm=focal_length_mm, pixel_size_um=pixel_size_um)
     except Exception as exc:
         return None, str(Path(fpath).name), f"Load error: {exc}"
 
@@ -197,6 +197,7 @@ def _process_directory(
     mode: str,
     n_workers: int,
     label: str = "",
+    pixel_size_um: Optional[float] = None,
 ) -> Tuple[List, int]:
     """
     Process a list of FITS file paths.
@@ -207,7 +208,7 @@ def _process_directory(
     all_metrics: List = []
     n_errors = 0
     n_total = len(fits_files)
-    worker_args = [(fp, focal_length, mode, config) for fp in fits_files]
+    worker_args = [(fp, focal_length, pixel_size_um, mode, config) for fp in fits_files]
 
     prefix = f"[{label}] " if label else ""
 
@@ -301,6 +302,8 @@ Examples:
                         help="Sigma multiplier for noise statistical rejection. Default: 2.5")
     parser.add_argument("--sigma-bg", type=float, default=3.0, metavar="SIGMA",
                         help="Sigma multiplier for background rejection. Default: 3.0")
+    parser.add_argument("--sigma-residual", type=float, default=3.0, metavar="SIGMA",
+                        help="Sigma multiplier for PSF residual flag (informational). Default: 3.0")
     parser.add_argument("--detection-threshold", type=float, default=5.0, metavar="SIGMA",
                         help="Star detection SNR threshold. Default: 5.0")
     parser.add_argument("--workers", type=int, default=1, metavar="N",
@@ -326,6 +329,9 @@ Examples:
                              "Default: <output_dir>/_staging.")
     parser.add_argument("--verbose", action="store_true", default=False,
                         help="Print verbose progress information.")
+    parser.add_argument("--config", metavar="FILE", default=None,
+                        help="Path to TOML config file. Default: auto-detect astro_eval.toml "
+                             "in INPUT_DIR or current directory.")
     parser.add_argument("--version", action="version", version=f"astro-eval {__version__}")
 
     return parser
@@ -819,7 +825,7 @@ def _watch_loop(
                 print(f"  Processing {len(new_files)} new {fid} frame(s)...")
                 for fpath in new_files:
                     metrics, fname, error = _process_frame(
-                        (str(fpath), args.focal_length, args.mode, config)
+                        (str(fpath), args.focal_length, pixel_size_um, args.mode, config)
                     )
                     if error:
                         print(f"    [warn] {fname}: {error}")
@@ -843,16 +849,16 @@ def _watch_loop(
                     filter_data: Dict = {}
                     for fid, metrics in filter_metrics.items():
                         if metrics:
-                            stats, results = evaluate_session(metrics, config)
+                            stats, results = evaluate_session(metrics, config, weights)
                             filter_data[fid] = (results, stats)
-                    generate_multi_filter_html_report(filter_data, html_path, input_dirs)
+                    generate_multi_filter_html_report(filter_data, html_path, input_dirs, weights=weights)
                 else:
                     fid = next(iter(filter_metrics))
                     metrics = filter_metrics[fid]
                     if metrics:
-                        stats, results = evaluate_session(metrics, config)
+                        stats, results = evaluate_session(metrics, config, weights)
                         generate_html_report(results, stats, html_path,
-                                             source_dir=input_dirs[fid])
+                                             source_dir=input_dirs[fid], weights=weights)
                         generate_csv_report(results, csv_path)
 
                 broadcaster.broadcast("reload")
@@ -879,6 +885,70 @@ def main(argv: Optional[List[str]] = None) -> int:
     args   = parser.parse_args(argv)
 
     _configure_logging(args.verbose)
+
+    # -----------------------------------------------------------------------
+    # TOML config file — apply defaults for any CLI arg left at its default
+    # -----------------------------------------------------------------------
+    from .config_loader import load_config, find_config_file
+    from .metrics import ScoringWeights
+
+    _config_path = Path(args.config) if args.config else find_config_file(Path(args.input_dir))
+    try:
+        _cfg = load_config(_config_path)
+    except FileNotFoundError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+
+    if _cfg:
+        print(f"Config: {_config_path}")
+
+    # Sentinel defaults — only apply config value when the CLI arg was not explicitly set
+    _CLI_DEFAULTS = {
+        "focal_length": 250.0, "fwhm_threshold": 5.0, "ecc_threshold": 0.5,
+        "star_fraction": 0.7,  "snr_fraction": 0.5,   "sigma_fwhm": 2.0,
+        "sigma_noise": 2.5,    "sigma_bg": 3.0,        "sigma_residual": 3.0,
+        "detection_threshold": 5.0,
+        "workers": 1,          "mode": "auto",         "html": False,
+        "serve": False,        "port": 7420,           "verbose": False,
+    }
+    _CFG_MAP = {
+        "focal_length":       "telescope.focal_length_mm",
+        "fwhm_threshold":     "rejection.fwhm_threshold_arcsec",
+        "ecc_threshold":      "rejection.ecc_threshold",
+        "star_fraction":      "rejection.star_count_fraction",
+        "snr_fraction":       "rejection.snr_fraction",
+        "sigma_fwhm":         "rejection.sigma_fwhm",
+        "sigma_noise":        "rejection.sigma_noise",
+        "sigma_bg":           "rejection.sigma_bg",
+        "sigma_residual":     "rejection.sigma_residual",
+        "detection_threshold":"processing.detection_threshold",
+        "workers":            "processing.workers",
+        "mode":               "processing.mode",
+        "html":               "output.html",
+        "serve":              "output.serve",
+        "port":               "output.port",
+        "verbose":            "output.verbose",
+    }
+    for attr, cfg_key in _CFG_MAP.items():
+        if getattr(args, attr) == _CLI_DEFAULTS[attr] and cfg_key in _cfg:
+            setattr(args, attr, _cfg[cfg_key])
+
+    # Pixel size fallback from config (used when FITS headers lack XPIXSZ/PIXSIZE1)
+    pixel_size_um: Optional[float] = _cfg.get("camera.pixel_size_um")
+
+    # Build scoring weights from config (falls back to defaults if not set)
+    weights = ScoringWeights(
+        star_fwhm  = _cfg.get("scoring.star.weight_fwhm",  0.30),
+        star_ecc   = _cfg.get("scoring.star.weight_ecc",   0.25),
+        star_stars = _cfg.get("scoring.star.weight_stars", 0.20),
+        star_snr   = _cfg.get("scoring.star.weight_snr",   0.00),
+        star_psfsw = _cfg.get("scoring.star.weight_psfsw", 0.25),
+        gas_snr    = _cfg.get("scoring.gas.weight_snr",    0.30),
+        gas_noise  = _cfg.get("scoring.gas.weight_noise",  0.20),
+        gas_bg     = _cfg.get("scoring.gas.weight_bg",     0.15),
+        gas_stars  = _cfg.get("scoring.gas.weight_stars",  0.20),
+        gas_psfsw  = _cfg.get("scoring.gas.weight_psfsw",  0.15),
+    )
 
     # --watch implies --serve
     if args.watch:
@@ -991,6 +1061,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         sigma_fwhm=args.sigma_fwhm,
         sigma_noise=args.sigma_noise,
         sigma_bg=args.sigma_bg,
+        sigma_residual=args.sigma_residual,
         mode=args.mode,
         verbose=args.verbose,
     )
@@ -1009,7 +1080,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 continue
             print(f"Processing {fid} ({len(fits_files_f)} files)...")
             metrics, n_err = _process_directory(
-                fits_files_f, config, args.focal_length, args.mode, n_workers, label=fid
+                fits_files_f, config, args.focal_length, args.mode, n_workers,
+                label=fid, pixel_size_um=pixel_size_um,
             )
             filter_metrics[fid] = metrics
             print(f"  Done: {len(metrics)} frames ({n_err} errors)  "
@@ -1018,7 +1090,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Processing frames...")
         fits_files = find_fits_files(input_dir)
         metrics, n_err = _process_directory(
-            fits_files, config, args.focal_length, args.mode, n_workers
+            fits_files, config, args.focal_length, args.mode, n_workers,
+            pixel_size_um=pixel_size_um,
         )
         filter_metrics[""] = metrics
         print(f"\nProcessed {len(metrics)} frames ({n_err} errors) "
@@ -1043,7 +1116,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if len(metrics) < 3:
                 print(f"  [warn] {fid}: only {len(metrics)} frames; "
                       "thresholds may be unreliable.")
-            stats, results = evaluate_session(metrics, config)
+            stats, results = evaluate_session(metrics, config, weights)
             filter_data[fid] = (results, stats)
 
         if not filter_data:
@@ -1058,7 +1131,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"CSV report: {fp}")
 
         if args.html or args.serve:
-            generate_multi_filter_html_report(filter_data, html_path, filter_dirs)
+            generate_multi_filter_html_report(filter_data, html_path, filter_dirs, weights=weights)
             print(f"HTML report: {html_path}")
 
         # Summary to stdout
@@ -1083,14 +1156,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if len(metrics) < 3:
             print(f"[warn] Only {len(metrics)} frames; thresholds may be unreliable.")
 
-        session_stats, results = evaluate_session(metrics, config)
+        session_stats, results = evaluate_session(metrics, config, weights)
         filter_data = {"": (results, session_stats)}
 
         generate_csv_report(results, csv_path)
         print(f"CSV report: {csv_path}")
 
         if args.html or args.serve:
-            generate_html_report(results, session_stats, html_path, source_dir=input_dir)
+            generate_html_report(results, session_stats, html_path, source_dir=input_dir, weights=weights)
             print(f"HTML report: {html_path}")
 
         # Summary to stdout

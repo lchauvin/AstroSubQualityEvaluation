@@ -40,6 +40,7 @@ class StarFitResult:
     fit_residual: float     # MAD(fitted - actual) / amplitude
     fit_method: str         # 'moffat' or 'gaussian'
     success: bool
+    beta: Optional[float] = None   # Moffat beta parameter (None for Gaussian fits)
 
 
 @dataclass
@@ -52,6 +53,7 @@ class PSFResult:
     fwhm_std: float         # pixels
     eccentricity_median: float
     psf_residual_median: float
+    beta_median: float      # Moffat beta median (nan for Gaussian-only sessions)
     individual: List[StarFitResult]
 
 
@@ -226,6 +228,7 @@ def _fit_moffat(
         fit_residual=norm_residual,
         fit_method="moffat",
         success=True,
+        beta=float(beta),
     )
 
 
@@ -388,6 +391,7 @@ def fit_psf(
             fwhm_std=float("nan"),
             eccentricity_median=float("nan"),
             psf_residual_median=float("nan"),
+            beta_median=float("nan"),
             individual=[],
         )
 
@@ -420,18 +424,21 @@ def fit_psf(
             fwhm_std=float("nan"),
             eccentricity_median=float("nan"),
             psf_residual_median=float("nan"),
+            beta_median=float("nan"),
             individual=[],
         )
 
     fwhms = np.array([r.fwhm_pix for r in individual if np.isfinite(r.fwhm_pix)])
     eccs = np.array([r.eccentricity for r in individual if np.isfinite(r.eccentricity)])
     residuals = np.array([r.fit_residual for r in individual if np.isfinite(r.fit_residual)])
+    betas = np.array([r.beta for r in individual if r.beta is not None and np.isfinite(r.beta)])
 
     fwhm_median = float(np.median(fwhms)) if len(fwhms) > 0 else float("nan")
     fwhm_mean = float(np.mean(fwhms)) if len(fwhms) > 0 else float("nan")
     fwhm_std = float(np.std(fwhms)) if len(fwhms) > 1 else float("nan")
     ecc_median = float(np.median(eccs)) if len(eccs) > 0 else float("nan")
     residual_median = float(np.median(residuals)) if len(residuals) > 0 else float("nan")
+    beta_median = float(np.median(betas)) if len(betas) > 0 else float("nan")
 
     return PSFResult(
         n_fitted=len(individual),
@@ -440,5 +447,6 @@ def fit_psf(
         fwhm_std=fwhm_std,
         eccentricity_median=ecc_median,
         psf_residual_median=residual_median,
+        beta_median=beta_median,
         individual=individual,
     )

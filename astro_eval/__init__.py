@@ -15,7 +15,7 @@ from .image_loader import load_fits, load_xisf, load_image, FITSData
 from .background import estimate_background, BackgroundStats
 from .star_detection import detect_stars, StarSource
 from .psf_fitting import fit_psf, PSFResult
-from .metrics import compute_star_metrics, compute_gas_metrics, FrameMetrics
+from .metrics import compute_star_metrics, compute_gas_metrics, FrameMetrics, ScoringWeights
 from .scoring import (
     compute_session_statistics,
     compute_rejection_flags,
@@ -42,6 +42,7 @@ __all__ = [
     "compute_star_metrics",
     "compute_gas_metrics",
     "FrameMetrics",
+    "ScoringWeights",
     "compute_session_statistics",
     "compute_rejection_flags",
     "compute_star_score",

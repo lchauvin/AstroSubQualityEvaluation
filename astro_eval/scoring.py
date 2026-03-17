@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .metrics import FrameMetrics, EvalConfig
+from .metrics import FrameMetrics, EvalConfig, ScoringWeights
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,9 @@ def compute_session_statistics(
         "eccentricity_median",
         "psf_residual_median",
         "snr_weight",
+        "psf_signal_weight",
+        "wfwhm",
+        "moffat_beta",
         "snr_estimate",
     ]
 
@@ -256,13 +259,22 @@ def compute_rejection_flags(
         else:
             flags["low_snr_weight"] = False
 
+        # High PSF residual (distorted stars, optical aberrations, trailing)
+        s = stat("psf_residual_median")
+        residual = frame_metrics.psf_residual_median
+        if s.count > 0 and math.isfinite(residual) and math.isfinite(s.median):
+            thresh = s.median + config.sigma_residual * s.std
+            flags["high_residual"] = residual > thresh
+        else:
+            flags["high_residual"] = False
+
     # Trail detection applies regardless of mode.
     # Airplane trails are hard-rejected; satellite trails are informational only.
     flags["airplane_trail"]  = frame_metrics.trail_type == "airplane"
     flags["satellite_trail"] = frame_metrics.trail_type in ("satellite", "unknown")
 
-    # satellite_trail is informational — never causes rejection on its own
-    _soft_flags = {"satellite_trail"}
+    # satellite_trail and high_residual are informational — never cause rejection on their own
+    _soft_flags = {"satellite_trail", "high_residual"}
     rejected = any(v for k, v in flags.items() if k not in _soft_flags)
     return RejectionFlags(
         filename=frame_metrics.filename,
@@ -292,48 +304,40 @@ def _normalize(value: float, min_val: float, max_val: float) -> float:
 def compute_star_score(
     metrics: FrameMetrics,
     session_stats: Dict[str, SessionStats],
+    weights: Optional[ScoringWeights] = None,
 ) -> float:
     """
     Compute composite quality score for a broadband frame.
 
-    Score = 0.30*(1 - norm_fwhm) + 0.25*(1 - norm_ecc) + 0.20*norm_stars + 0.25*norm_snr
+    Score = w_fwhm*(1-norm_fwhm) + w_ecc*(1-norm_ecc) + w_stars*norm_stars
+          + w_psfsw*norm_psfsw
+
+    snr_weight is retained in the CSV/HTML output for reference but has a
+    default weight of 0.0 — PSFSignalWeight supersedes it because it already
+    incorporates the amplitude/noise ratio plus a 1/FWHM² correction.
 
     All metrics are normalized to [0, 1] across the session range.
-
-    Parameters
-    ----------
-    metrics:
-        FrameMetrics for the frame.
-    session_stats:
-        Session-level statistics.
-
-    Returns
-    -------
-    Float score in [0, 1]; higher is better.
     """
+    w = weights or ScoringWeights()
+
     def s(name: str) -> SessionStats:
         return session_stats.get(name, SessionStats(
             name, 0, float("nan"), float("nan"), float("nan"),
             float("nan"), float("nan"),
         ))
 
-    fwhm_s = s("fwhm_median")
-    norm_fwhm = _normalize(metrics.fwhm_median, fwhm_s.min_val, fwhm_s.max_val)
-
-    ecc_s = s("eccentricity_median")
-    norm_ecc = _normalize(metrics.eccentricity_median, ecc_s.min_val, ecc_s.max_val)
-
-    stars_s = s("n_stars")
-    norm_stars = _normalize(float(metrics.n_stars), stars_s.min_val, stars_s.max_val)
-
-    snr_s = s("snr_weight")
-    norm_snr = _normalize(metrics.snr_weight, snr_s.min_val, snr_s.max_val)
+    norm_fwhm  = _normalize(metrics.fwhm_median,        s("fwhm_median").min_val,        s("fwhm_median").max_val)
+    norm_ecc   = _normalize(metrics.eccentricity_median, s("eccentricity_median").min_val, s("eccentricity_median").max_val)
+    norm_stars = _normalize(float(metrics.n_stars),      s("n_stars").min_val,             s("n_stars").max_val)
+    norm_snr   = _normalize(metrics.snr_weight,          s("snr_weight").min_val,          s("snr_weight").max_val)
+    norm_psfsw = _normalize(metrics.psf_signal_weight,   s("psf_signal_weight").min_val,   s("psf_signal_weight").max_val)
 
     score = (
-        0.30 * (1.0 - norm_fwhm)
-        + 0.25 * (1.0 - norm_ecc)
-        + 0.20 * norm_stars
-        + 0.25 * norm_snr
+        w.star_fwhm  * (1.0 - norm_fwhm)
+        + w.star_ecc   * (1.0 - norm_ecc)
+        + w.star_stars * norm_stars
+        + w.star_snr   * norm_snr       # 0.0 by default; configurable for back-compat
+        + w.star_psfsw * norm_psfsw
     )
     return float(np.clip(score, 0.0, 1.0))
 
@@ -341,46 +345,33 @@ def compute_star_score(
 def compute_gas_score(
     metrics: FrameMetrics,
     session_stats: Dict[str, SessionStats],
+    weights: Optional[ScoringWeights] = None,
 ) -> float:
     """
     Compute composite quality score for a narrowband frame.
 
-    Score = 0.40*norm_snr + 0.25*(1-norm_noise) + 0.15*(1-norm_bg) + 0.20*norm_stars
-
-    Parameters
-    ----------
-    metrics:
-        FrameMetrics for the frame.
-    session_stats:
-        Session-level statistics.
-
-    Returns
-    -------
-    Float score in [0, 1]; higher is better.
+    Score = w_snr*norm_snr + w_noise*(1-norm_noise) + w_bg*(1-norm_bg) + w_stars*norm_stars
     """
+    w = weights or ScoringWeights()
+
     def s(name: str) -> SessionStats:
         return session_stats.get(name, SessionStats(
             name, 0, float("nan"), float("nan"), float("nan"),
             float("nan"), float("nan"),
         ))
 
-    snr_s = s("snr_estimate")
-    norm_snr = _normalize(metrics.snr_estimate, snr_s.min_val, snr_s.max_val)
-
-    noise_s = s("background_rms")
-    norm_noise = _normalize(metrics.background_rms, noise_s.min_val, noise_s.max_val)
-
-    bg_s = s("background_median")
-    norm_bg = _normalize(metrics.background_median, bg_s.min_val, bg_s.max_val)
-
-    stars_s = s("n_stars")
-    norm_stars = _normalize(float(metrics.n_stars), stars_s.min_val, stars_s.max_val)
+    norm_snr   = _normalize(metrics.snr_estimate,    s("snr_estimate").min_val,    s("snr_estimate").max_val)
+    norm_noise = _normalize(metrics.background_rms,  s("background_rms").min_val,  s("background_rms").max_val)
+    norm_bg    = _normalize(metrics.background_median, s("background_median").min_val, s("background_median").max_val)
+    norm_stars = _normalize(float(metrics.n_stars),  s("n_stars").min_val,         s("n_stars").max_val)
+    norm_psfsw = _normalize(metrics.psf_signal_weight, s("psf_signal_weight").min_val, s("psf_signal_weight").max_val)
 
     score = (
-        0.40 * norm_snr
-        + 0.25 * (1.0 - norm_noise)
-        + 0.15 * (1.0 - norm_bg)
-        + 0.20 * norm_stars
+        w.gas_snr   * norm_snr
+        + w.gas_noise * (1.0 - norm_noise)
+        + w.gas_bg    * (1.0 - norm_bg)
+        + w.gas_stars * norm_stars
+        + w.gas_psfsw * norm_psfsw
     )
     return float(np.clip(score, 0.0, 1.0))
 
@@ -399,6 +390,7 @@ _TRAIL_PENALTY: dict = {
 def compute_score(
     metrics: FrameMetrics,
     session_stats: Dict[str, SessionStats],
+    weights: Optional[ScoringWeights] = None,
 ) -> float:
     """
     Compute composite quality score, then apply trail penalty.
@@ -407,9 +399,9 @@ def compute_score(
     among frames of the same trail type.
     """
     if metrics.mode == "gas":
-        base = compute_gas_score(metrics, session_stats)
+        base = compute_gas_score(metrics, session_stats, weights)
     else:
-        base = compute_star_score(metrics, session_stats)
+        base = compute_star_score(metrics, session_stats, weights)
 
     multiplier = _TRAIL_PENALTY.get(metrics.trail_type, 1.0)
     return float(np.clip(base * multiplier, 0.0, 1.0))
@@ -427,6 +419,7 @@ class FrameResult:
 def evaluate_session(
     all_metrics: List[FrameMetrics],
     config: EvalConfig,
+    weights: Optional[ScoringWeights] = None,
 ) -> tuple[Dict[str, SessionStats], List[FrameResult]]:
     """
     Evaluate all frames: compute session statistics, scores, and rejection flags.
@@ -447,7 +440,7 @@ def evaluate_session(
     results: List[FrameResult] = []
     for m in all_metrics:
         rejection = compute_rejection_flags(m, session_stats, config)
-        score = compute_score(m, session_stats)
+        score = compute_score(m, session_stats, weights)
         rejection.score = score
         results.append(FrameResult(metrics=m, rejection=rejection, score=score))
 

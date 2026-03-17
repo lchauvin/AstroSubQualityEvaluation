@@ -13,6 +13,8 @@ Tuned for:
 - **Camera:** QHY MiniCam 8M (pixel size read from FITS headers: `XPIXSZ` or `PIXSIZE1`)
 - **Pixel scale:** `206.265 × pixel_size_µm / focal_length_mm` arcsec/pixel
 
+If your camera doesn't write pixel size to FITS headers, set `pixel_size_um` in `astro_eval.toml` (see [Config File](#config-file)) or the pixel scale falls back to the built-in default (3.1 arcsec/px for Redcat 51 + 3.76 µm).
+
 ## Installation
 
 ```bash
@@ -57,8 +59,8 @@ astro-eval ./staging --watch --html \
 
 | Mode | Target | Key Metrics |
 |------|--------|-------------|
-| `star` | Broadband (L, R, G, B, RGB, Clear) | FWHM, Eccentricity, Star count, SNR weight |
-| `gas` | Narrowband (Ha, OIII, SII) | Background noise, SNR estimate, Star count (transparency) |
+| `star` | Broadband (L, R, G, B, RGB, Clear) | FWHM, wFWHM, Eccentricity, Star count, SNR weight, PSFSignalWeight, Moffat β |
+| `gas` | Narrowband (Ha, OIII, SII) | Background noise, SNR estimate (p95), Star count (transparency), PSFSignalWeight, wFWHM, Moffat β |
 | `auto` | Auto-detect from `FILTER` header | Dispatches to star or gas |
 
 ### Auto-detection filter mapping
@@ -129,6 +131,51 @@ Copy-Item "$env:USERPROFILE\.ssh\authorized_keys" "C:\ProgramData\ssh\administra
 icacls "C:\ProgramData\ssh\administrators_authorized_keys" /inheritance:r /grant:r "SYSTEM:F" /grant:r "BUILTIN\Administrators:F"
 ```
 
+## Config File
+
+All CLI options can also be set in a TOML config file, making it easy to store per-scope or per-session defaults. CLI arguments always override the config file.
+
+**Search order:**
+1. `--config FILE` (explicit path)
+2. `INPUT_DIR/astro_eval.toml`
+3. `./astro_eval.toml` (current working directory)
+
+Copy and edit the provided example:
+
+```bash
+cp astro_eval.toml.example /path/to/session/astro_eval.toml
+```
+
+Key sections:
+
+```toml
+[telescope]
+focal_length_mm = 250.0
+
+[camera]
+pixel_size_um = 3.76   # fallback if not in FITS headers
+
+[rejection]
+fwhm_threshold_arcsec = 5.0
+sigma_fwhm   = 2.0
+sigma_noise  = 2.5
+sigma_bg     = 3.0
+sigma_residual = 3.0   # PSF residual flag threshold (informational)
+
+[scoring.star]
+weight_fwhm  = 0.30
+weight_ecc   = 0.25
+weight_stars = 0.20
+weight_psfsw = 0.25   # PSFSignalWeight (supersedes snr_weight)
+
+[scoring.gas]
+weight_snr   = 0.30   # reduced; PSFSignalWeight captures overlapping SNR info
+weight_noise = 0.20
+weight_bg    = 0.15
+weight_stars = 0.20
+weight_psfsw = 0.15   # PSFSignalWeight — star sharpness bonus, useful even in NB
+```
+
 ## CLI Reference
 
 ```
@@ -145,6 +192,7 @@ astro-eval INPUT_DIR [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--config FILE` | auto | Path to `astro_eval.toml` config file |
 | `--mode {star,gas,auto}` | `auto` | Evaluation mode |
 | `--output DIR` | `INPUT_DIR` | Output directory for reports |
 | `--focal-length MM` | `250.0` | Telescope focal length (mm) |
@@ -155,6 +203,7 @@ astro-eval INPUT_DIR [OPTIONS]
 | `--sigma-fwhm SIGMA` | `2.0` | Sigma multiplier for FWHM statistical rejection |
 | `--sigma-noise SIGMA` | `2.5` | Sigma multiplier for noise statistical rejection |
 | `--sigma-bg SIGMA` | `3.0` | Sigma multiplier for background level rejection |
+| `--sigma-residual SIGMA` | `3.0` | Sigma multiplier for PSF residual flag (informational) |
 | `--detection-threshold SIGMA` | `5.0` | Star detection sigma threshold |
 | `--workers N` | `1` | Parallel worker processes for frame evaluation |
 | `--html` | off | Generate HTML report with plots |
@@ -183,10 +232,17 @@ One file per filter: `astro_eval_report.csv` (single filter) or `astro_eval_repo
 | `exptime_s` | Exposure time (seconds) |
 | `n_stars` | Detected star count |
 | `fwhm_median_arcsec` | Median FWHM in arcseconds |
+| `fwhm_mean_arcsec` | Mean FWHM in arcseconds |
 | `eccentricity_median` | Median stellar eccentricity [0–1] |
-| `snr_weight` | SNR weight proxy (broadband) |
-| `snr_estimate` | Nebula SNR estimate (narrowband) |
+| `psf_residual_median` | Median normalized PSF fit residual |
+| `snr_weight` | SNR weight proxy: `Σflux² / (noise² × N)` |
+| `psf_signal_weight` | PSFSignalWeight: `ΣA² / (2×noise²×N×FWHM²)` — penalizes FWHM super-linearly |
+| `wfwhm_arcsec` | wFWHM = `FWHM / √N_stars` — combined seeing+transparency metric |
+| `moffat_beta` | Moffat β parameter (atmospheric seeing index; typical 2.5–5) |
+| `snr_estimate` | Nebula SNR estimate via 95th-percentile method (narrowband) |
+| `background_median` | Median sky background (ADU) |
 | `background_rms` | Background noise RMS (ADU) |
+| `noise_mad` | Robust noise estimate via MAD (ADU) |
 | `score` | Composite quality score [0–1] |
 | `rejected` | `1` if frame rejected, `0` if accepted |
 | `rejection_reasons` | Pipe-separated rejection criterion names |
@@ -208,33 +264,45 @@ Self-contained HTML file (no external dependencies) including:
 
 ### Star Mode (Broadband)
 
-**FWHM** — Full Width at Half Maximum of the stellar PSF, fitted using a Moffat profile (Gaussian fallback). Measured in pixels, reported in arcseconds. Lower is better.
+**FWHM** — Full Width at Half Maximum of the stellar PSF, fitted using a 2D elliptical Moffat profile (Gaussian fallback). Measured in pixels, reported in arcseconds. Lower is better. Typical range: 1.5–5 arcsec.
 
-**Eccentricity** — Departure from circular PSF: `sqrt(1 - (b/a)²)`. 0 = perfect circle, approaching 1 = elongated. Caused by tracking errors, wind, or collimation issues.
+**wFWHM** — Siril-inspired *weighted FWHM*: `FWHM_arcsec / √n_stars`. Combines seeing quality and sky transparency — a frame with poor seeing or few stars both result in a higher (worse) value. Lower is better.
 
-**SNR Weight** — `Σ(flux²) / (noise² × N_stars)`. Higher means brighter stars relative to noise floor.
+**Eccentricity** — Departure from circular PSF: `√(1 − (b/a)²)`. 0 = perfect circle, approaching 1 = elongated. Caused by tracking errors, wind, or collimation issues. Typical acceptance threshold: < 0.5.
 
-**Star Count** — Number of detected sources. Drops significantly with clouds or focus shift.
+**SNR Weight** — `Σ(flux²) / (noise² × N)`. Higher means brighter stars relative to noise floor. Useful for detecting thin clouds or transparency loss.
+
+**PSFSignalWeight** — PixInsight-inspired metric: `(Σ amplitude_i)² / (2 × noise² × N × FWHM_px²)`. Unlike SNR weight, penalizes FWHM super-linearly (~1/FWHM²), so frames with sharp stars rank significantly higher than blurry frames with equal total flux. Higher is better.
+
+**Moffat β** — Power-law exponent of the fitted Moffat PSF profile. Reflects atmospheric turbulence: β ≈ 2.5 for strong atmospheric seeing, β ≈ 4–5 for better conditions. Informational only — not used in rejection decisions.
+
+**PSF Residual** — Normalized median absolute deviation between the fitted PSF and the actual pixel data: `MAD(fitted − actual) / amplitude`. High values indicate distorted or trailed stars, optical aberrations, or double stars. Informational by default; flagged if `> session_median + sigma_residual × std`.
+
+**Star Count** — Number of detected sources above the SNR threshold. Drops significantly with clouds or focus shift.
 
 ### Gas Mode (Narrowband)
 
-**SNR Estimate** — `(signal_region_median - background_median) / background_rms`. Higher is better.
+**SNR Estimate** — `(p95 − background_median) / background_rms` where p95 is the 95th percentile pixel value. This threshold-independent method gives SNR ≈ 1.6 for pure background (normal distribution p95 = μ + 1.645σ) and higher values for frames with genuine nebula signal. Higher is better.
 
-**Background RMS** — Noise level of the sky background. Higher values indicate light pollution, moon contamination, or sky glow.
+**Background RMS** — Noise level of the sky background (ADU). Higher values indicate light pollution, moon contamination, or sky glow. The primary rejection criterion for narrowband.
 
-**Star Count** — Used as a transparency proxy.
+**Star Count** — Used as a transparency proxy even in narrowband — fewer detected stars indicates reduced sky transparency.
+
+**PSFSignalWeight, wFWHM, Moffat β, FWHM, Eccentricity** — PSF fitting is also run in gas mode (same algorithm as star mode). These metrics are populated in the CSV/HTML output and `psf_signal_weight` contributes to the Gas Score (weight 0.15). They are informational in the context of narrowband imaging — star shape doesn't affect nebula detail — but help discriminate between otherwise similar frames and catch severe tracking or focus issues.
 
 ## Scoring
 
 ### Star Score
 ```
-Score = 0.30×(1 - norm_FWHM) + 0.25×(1 - norm_Ecc) + 0.20×norm_Stars + 0.25×norm_SNR
+Score = 0.30×(1 - norm_FWHM) + 0.25×(1 - norm_Ecc) + 0.20×norm_Stars + 0.25×norm_PSFSignalWeight
 ```
+`snr_weight` is retained in the output (CSV/HTML) for reference but has a default weight of 0 — PSFSignalWeight supersedes it because it already captures the amplitude/noise ratio with an additional 1/FWHM² correction. It can be re-enabled via `weight_snr` in `astro_eval.toml` if PSF fitting is unreliable in your data.
 
 ### Gas Score
 ```
-Score = 0.40×norm_SNR + 0.25×(1 - norm_Noise) + 0.15×(1 - norm_BG) + 0.20×norm_Stars
+Score = 0.30×norm_SNR + 0.20×(1 - norm_Noise) + 0.15×(1 - norm_BG) + 0.20×norm_Stars + 0.15×norm_PSFSignalWeight
 ```
+PSF fitting is also run in gas mode to populate `psf_signal_weight`, `wfwhm`, and `moffat_beta`. The PSFSignalWeight contribution is weighted lower (0.15) than in star mode because atmospheric seeing is less critical for extended emission nebulae, but it still provides a useful star-quality discriminator between frames.
 
 All metrics are normalized to [0, 1] across the session. Score of 1.0 is the best frame in the session. Statistics are computed **independently per filter** in multi-filter mode.
 
@@ -242,21 +310,29 @@ All metrics are normalized to [0, 1] across the session. Score of 1.0 is the bes
 
 ### Star Mode
 
-| Criterion | Condition |
-|-----------|-----------|
-| `high_fwhm` | FWHM > session_median + 2σ **OR** FWHM > `--fwhm-threshold` |
-| `high_eccentricity` | Eccentricity > `--ecc-threshold` |
-| `low_stars` | Stars < session_median × `--star-fraction` |
-| `low_snr_weight` | SNR weight < session_median × `--snr-fraction` |
+| Criterion | Condition | Hard reject? |
+|-----------|-----------|-------------|
+| `high_fwhm` | FWHM > session_median + `--sigma-fwhm` × σ **OR** FWHM > `--fwhm-threshold` | Yes |
+| `high_eccentricity` | Eccentricity > `--ecc-threshold` | Yes |
+| `low_stars` | Stars < session_median × `--star-fraction` | Yes |
+| `low_snr_weight` | SNR weight < session_median × `--snr-fraction` | Yes |
+| `high_residual` | PSF residual > session_median + `--sigma-residual` × σ | No (informational) |
 
 ### Gas Mode
 
-| Criterion | Condition |
-|-----------|-----------|
-| `high_noise` | Background RMS > session_median + 2.5σ |
-| `high_background` | Background median > session_median + 3σ |
-| `low_snr` | SNR estimate < session_median × 0.5 |
-| `low_stars` | Stars < session_median × 0.7 |
+| Criterion | Condition | Hard reject? |
+|-----------|-----------|-------------|
+| `high_noise` | Background RMS > session_median + `--sigma-noise` × σ | Yes |
+| `high_background` | Background median > session_median + `--sigma-bg` × σ | Yes |
+| `low_snr` | SNR estimate < session_median × `--snr-fraction` | Yes |
+| `low_stars` | Stars < session_median × `--star-fraction` | Yes |
+
+### All Modes
+
+| Criterion | Condition | Hard reject? |
+|-----------|-----------|-------------|
+| `airplane_trail` | Airplane/double contrail detected | Yes |
+| `satellite_trail` | Single satellite trail detected | No (informational) |
 
 > **Note:** Gradients and vignetting are intentionally **not** rejection criteria — these are correctable in post-processing with calibration frames.
 

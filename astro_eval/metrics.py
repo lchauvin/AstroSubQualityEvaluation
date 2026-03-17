@@ -27,6 +27,30 @@ DEFAULT_PIXEL_SCALE = 206.265 * 3.76 / 250.0
 
 
 @dataclass
+class ScoringWeights:
+    """
+    Configurable weights for the composite quality score equations.
+
+    All weights within a mode should sum to 1.0.  Values outside that range
+    are accepted (the score is clipped to [0, 1] regardless), but a warning
+    is issued by the config loader if the sum deviates significantly from 1.0.
+    """
+    # Star / broadband score weights
+    star_fwhm:  float = 0.30
+    star_ecc:   float = 0.25
+    star_stars: float = 0.20
+    star_psfsw: float = 0.25   # PSFSignalWeight: combined FWHM+amplitude+noise metric
+    star_snr:   float = 0.00   # legacy SNR weight — kept for CSV/HTML output, not used in scoring
+
+    # Gas / narrowband score weights
+    gas_snr:    float = 0.30   # reduced from 0.40; PSFSignalWeight captures much of the same signal
+    gas_noise:  float = 0.20   # reduced from 0.25
+    gas_bg:     float = 0.15
+    gas_stars:  float = 0.20
+    gas_psfsw:  float = 0.15   # PSFSignalWeight: amplitude×SNR×1/FWHM² — partial but useful in NB
+
+
+@dataclass
 class EvalConfig:
     """
     Configuration for metric computation and rejection thresholds.
@@ -49,6 +73,8 @@ class EvalConfig:
 
     # Mode
     mode: str = "auto"  # 'star', 'gas', or 'auto'
+
+    sigma_residual: float = 3.0    # sigma for PSF residual statistical rejection
 
     verbose: bool = False
 
@@ -79,6 +105,9 @@ class FrameMetrics:
     eccentricity_median: float = float("nan")
     psf_residual_median: float = float("nan")
     snr_weight: float = float("nan")
+    psf_signal_weight: float = float("nan")  # PSFSignalWeight: combines amplitude, FWHM, noise (1/FWHM² penalty)
+    wfwhm: float = float("nan")              # Siril wFWHM = FWHM_arcsec / sqrt(n_stars); lower = better
+    moffat_beta: float = float("nan")        # Moffat beta parameter (atmospheric seeing index)
 
     # Gas / narrowband metrics
     snr_estimate: float = float("nan")
@@ -87,6 +116,9 @@ class FrameMetrics:
     n_trails: int = 0
     trail_length_fraction: float = float("nan")
     trail_type: str = "none"   # 'none', 'satellite', 'airplane', 'unknown'
+
+    # Observation time (ISO-8601 string from DATE-OBS header, for trend charts)
+    obs_time: Optional[str] = None
 
     # Processing notes
     error: Optional[str] = None
@@ -116,17 +148,44 @@ def _compute_snr_weight(
     return float(np.sum(fluxes ** 2) / (noise_rms ** 2 * len(fluxes)))
 
 
+def _compute_psf_signal_weight(psf, noise_rms: float) -> float:
+    """
+    PixInsight-inspired PSFSignalWeight.
+
+    Combines fitted peak amplitudes with noise and FWHM, penalizing larger
+    FWHM super-linearly (~1/FWHM²).  Unlike snr_weight (which uses aperture
+    flux), this metric directly rewards frames where stars are sharp.
+
+    Formula: (Σ A_i)² / (2 × noise² × n × FWHM_px_median²)
+    """
+    individual = [
+        r for r in psf.individual
+        if r.success and math.isfinite(r.amplitude) and math.isfinite(r.fwhm_pix)
+        and r.amplitude > 0
+    ]
+    if not individual or noise_rms <= 0:
+        return float("nan")
+    if not math.isfinite(psf.fwhm_median) or psf.fwhm_median <= 0:
+        return float("nan")
+    amp_sum = sum(r.amplitude for r in individual)
+    n = len(individual)
+    fwhm_px = psf.fwhm_median
+    return float((amp_sum ** 2) / (2.0 * noise_rms ** 2 * n * fwhm_px ** 2))
+
+
 def _estimate_gas_snr(
     image: np.ndarray,
     bg_stats: BackgroundStats,
-    sigma_clip: float = 3.0,
 ) -> float:
     """
-    Estimate SNR for a narrowband frame.
+    Estimate SNR for a narrowband frame using the 95th-percentile method.
 
-    The 'signal region' is identified by finding pixels significantly
-    above the background (via sigma-clipping outliers above bg median).
-    SNR = (signal_region_median - background_median) / background_rms.
+    SNR = (p95 - background_median) / background_rms
+
+    Using the 95th percentile as the signal reference is robust and
+    threshold-independent: for a pure-background frame, p95 ≈ bg + 1.6*rms
+    (≈1.6 SNR), while a frame with bright nebulosity gives a higher value.
+    This avoids the sigma-clip sensitivity of the previous sigma=3 threshold.
     """
     if bg_stats.background_rms <= 0:
         return float("nan")
@@ -134,19 +193,8 @@ def _estimate_gas_snr(
     bg_med = bg_stats.background_median
     bg_rms = max(bg_stats.background_rms, bg_stats.noise_mad, 1.0)
 
-    # Signal pixels: those above background + sigma_clip * rms
-    threshold = bg_med + sigma_clip * bg_rms
-    signal_mask = image > threshold
-
-    n_signal = int(np.sum(signal_mask))
-    n_total = image.size
-
-    if n_signal < 10:
-        # Very few signal pixels - might be a blank frame or deep sky with little emission
-        return float(0.0)
-
-    signal_median = float(np.median(image[signal_mask]))
-    snr = (signal_median - bg_med) / bg_rms
+    p95 = float(np.percentile(image, 95))
+    snr = (p95 - bg_med) / bg_rms
     return max(snr, 0.0)
 
 
@@ -182,6 +230,7 @@ def compute_star_metrics(
         gain=fits_data.gain,
         ccd_temp=fits_data.ccd_temp,
         pixel_scale=pixel_scale,
+        obs_time=fits_data.obs_time,
     )
 
     # Step 1: Background estimation
@@ -215,6 +264,7 @@ def compute_star_metrics(
         return metrics
 
     # Step 3: PSF fitting
+    psf = None
     try:
         psf = fit_psf(image, sources)
         if psf.n_fitted > 0:
@@ -224,11 +274,13 @@ def compute_star_metrics(
             metrics.fwhm_std = psf.fwhm_std * scale
             metrics.eccentricity_median = psf.eccentricity_median
             metrics.psf_residual_median = psf.psf_residual_median
+            metrics.moffat_beta = psf.beta_median
             logger.debug(
-                "%s: PSF FWHM=%.2f\" ecc=%.3f from %d stars.",
+                "%s: PSF FWHM=%.2f\" ecc=%.3f beta=%.2f from %d stars.",
                 fits_data.filename,
                 metrics.fwhm_median,
                 metrics.eccentricity_median,
+                metrics.moffat_beta if math.isfinite(metrics.moffat_beta) else 0.0,
                 psf.n_fitted,
             )
         else:
@@ -237,13 +289,18 @@ def compute_star_metrics(
     except Exception as exc:
         logger.error("PSF fitting failed for %s: %s", fits_data.filename, exc)
         metrics.warnings.append(f"PSF fitting error: {exc}")
+        psf = None
 
-    # Step 4: SNR weight
+    # Step 4: SNR weight + PSFSignalWeight + wFWHM
     try:
         noise = max(bg_stats.background_rms, bg_stats.noise_mad, 1.0)
         metrics.snr_weight = _compute_snr_weight(sources, noise)
+        if psf is not None and psf.n_fitted > 0:
+            metrics.psf_signal_weight = _compute_psf_signal_weight(psf, noise)
+            if math.isfinite(metrics.fwhm_median) and metrics.n_stars > 0:
+                metrics.wfwhm = metrics.fwhm_median / math.sqrt(metrics.n_stars)
     except Exception as exc:
-        logger.warning("SNR weight computation failed for %s: %s", fits_data.filename, exc)
+        logger.warning("SNR/PSF weight computation failed for %s: %s", fits_data.filename, exc)
 
     # Step 5: Trail detection
     try:
@@ -296,6 +353,7 @@ def compute_gas_metrics(
         gain=fits_data.gain,
         ccd_temp=fits_data.ccd_temp,
         pixel_scale=pixel_scale,
+        obs_time=fits_data.obs_time,
     )
 
     # Step 1: Background estimation
@@ -334,7 +392,43 @@ def compute_gas_metrics(
             "Star detection failed for gas frame %s: %s", fits_data.filename, exc
         )
 
-    # Step 4: Trail detection
+    # Step 4: PSF fitting (star shape quality — useful even in narrowband for PSFSW)
+    if metrics.n_stars > 0:
+        psf = None
+        try:
+            psf = fit_psf(image, sources)
+            if psf.n_fitted > 0:
+                scale = pixel_scale
+                metrics.fwhm_median = psf.fwhm_median * scale
+                metrics.fwhm_mean = psf.fwhm_mean * scale
+                metrics.fwhm_std = psf.fwhm_std * scale
+                metrics.eccentricity_median = psf.eccentricity_median
+                metrics.psf_residual_median = psf.psf_residual_median
+                metrics.moffat_beta = psf.beta_median
+                logger.debug(
+                    "%s (gas): PSF FWHM=%.2f\" ecc=%.3f beta=%.2f from %d stars.",
+                    fits_data.filename,
+                    metrics.fwhm_median,
+                    metrics.eccentricity_median,
+                    metrics.moffat_beta if math.isfinite(metrics.moffat_beta) else 0.0,
+                    psf.n_fitted,
+                )
+            else:
+                metrics.warnings.append("PSF fitting returned no valid results.")
+        except Exception as exc:
+            logger.warning("PSF fitting failed for gas frame %s: %s", fits_data.filename, exc)
+            psf = None
+
+        try:
+            noise = max(bg_stats.background_rms, bg_stats.noise_mad, 1.0)
+            if psf is not None and psf.n_fitted > 0:
+                metrics.psf_signal_weight = _compute_psf_signal_weight(psf, noise)
+                if math.isfinite(metrics.fwhm_median) and metrics.n_stars > 0:
+                    metrics.wfwhm = metrics.fwhm_median / math.sqrt(metrics.n_stars)
+        except Exception as exc:
+            logger.warning("PSF weight computation failed for gas frame %s: %s", fits_data.filename, exc)
+
+    # Step 5: Trail detection
     try:
         trail = detect_trails(
             image,

@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .metrics import FrameMetrics
+from .metrics import FrameMetrics, ScoringWeights
 from .scoring import FrameResult, SessionStats
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,9 @@ CSV_COLUMNS = [
     "eccentricity_median",
     "psf_residual_median",
     "snr_weight",
+    "psf_signal_weight",
+    "wfwhm_arcsec",
+    "moffat_beta",
     "snr_estimate",
     "background_median",
     "background_rms",
@@ -64,6 +67,7 @@ CSV_COLUMNS = [
     "flag_high_eccentricity",
     "flag_low_stars",
     "flag_low_snr_weight",
+    "flag_high_residual",
     "flag_high_noise",
     "flag_high_background",
     "flag_low_snr",
@@ -102,6 +106,9 @@ def _result_to_row(result: FrameResult) -> dict:
         "eccentricity_median": _fmt(m.eccentricity_median),
         "psf_residual_median": _fmt(m.psf_residual_median),
         "snr_weight": _fmt(m.snr_weight),
+        "psf_signal_weight": _fmt(m.psf_signal_weight),
+        "wfwhm_arcsec": _fmt(m.wfwhm),
+        "moffat_beta": _fmt(m.moffat_beta, precision=3),
         "snr_estimate": _fmt(m.snr_estimate),
         "background_median": _fmt(m.background_median),
         "background_rms": _fmt(m.background_rms),
@@ -118,6 +125,7 @@ def _result_to_row(result: FrameResult) -> dict:
         "flag_high_eccentricity": "1" if r.flags.get("high_eccentricity") else "0",
         "flag_low_stars": "1" if r.flags.get("low_stars") else "0",
         "flag_low_snr_weight": "1" if r.flags.get("low_snr_weight") else "0",
+        "flag_high_residual": "1" if r.flags.get("high_residual") else "0",
         "flag_high_noise": "1" if r.flags.get("high_noise") else "0",
         "flag_high_background": "1" if r.flags.get("high_background") else "0",
         "flag_low_snr": "1" if r.flags.get("low_snr") else "0",
@@ -162,6 +170,123 @@ def _make_plot_base64(fig) -> str:
     fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("ascii")
+
+
+def _parse_obs_time(s: Optional[str]):
+    """Parse an ISO-8601 DATE-OBS string into a datetime, or return None."""
+    if not s:
+        return None
+    from datetime import datetime
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _plot_quality_trend(
+    results: List[FrameResult],
+    filter_name: str = "",
+) -> Optional[str]:
+    """
+    Return base64 PNG of quality-over-time trend chart, or None on failure.
+
+    X-axis: observation datetime (DATE-OBS) when available for ≥50% of frames,
+            otherwise frame index sorted by filename.
+    Left Y-axis:  FWHM (arcsec) for star mode, background RMS (ADU) for gas mode.
+    Right Y-axis: composite quality score [0, 1].
+    Rejected frames are marked with red circles.
+    """
+    if not results:
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+
+        # Sort by filename for consistent ordering
+        ordered = sorted(results, key=lambda r: r.metrics.filename)
+
+        # Determine mode from first result
+        is_gas = ordered[0].metrics.mode == "gas"
+
+        # Try to use datetime x-axis
+        times = [_parse_obs_time(r.metrics.obs_time) for r in ordered]
+        use_time = sum(1 for t in times if t is not None) >= len(ordered) * 0.5
+
+        if use_time:
+            xs = [t if t is not None else times[i - 1] for i, t in enumerate(times)]
+        else:
+            xs = list(range(len(ordered)))
+
+        primary_vals = [
+            r.metrics.background_rms if is_gas else r.metrics.fwhm_median
+            for r in ordered
+        ]
+        primary_label = "Background RMS (ADU)" if is_gas else "FWHM (arcsec)"
+        score_vals = [r.score for r in ordered]
+        rejected = [r.rejection.rejected for r in ordered]
+
+        finite_primary = [v for v in primary_vals if math.isfinite(v)]
+        if not finite_primary:
+            return None
+
+        fig, ax1 = plt.subplots(figsize=(16, 4))
+        ax2 = ax1.twinx()
+
+        primary_color = "#5b9bd5"
+        score_color   = "#f0ad4e"
+
+        # Primary metric line
+        valid_xs = [x for x, v in zip(xs, primary_vals) if math.isfinite(v)]
+        valid_ys = [v for v in primary_vals if math.isfinite(v)]
+        ax1.plot(valid_xs, valid_ys, color=primary_color, linewidth=1.2, zorder=2)
+
+        # Rejected frame markers
+        rej_xs = [x for x, v, r in zip(xs, primary_vals, rejected) if r and math.isfinite(v)]
+        rej_ys = [v for v, r in zip(primary_vals, rejected) if r and math.isfinite(v)]
+        if rej_xs:
+            ax1.scatter(rej_xs, rej_ys, color="#d9534f", s=35, zorder=5,
+                        label="Rejected")
+
+        # Session median line
+        med = float(np.nanmedian(finite_primary))
+        ax1.axhline(med, color=primary_color, linestyle="--", linewidth=1,
+                    alpha=0.6, label=f"Median: {med:.2f}")
+
+        # Score line (right axis)
+        valid_score_xs = [x for x, v in zip(xs, score_vals) if math.isfinite(v)]
+        valid_score_ys = [v for v in score_vals if math.isfinite(v)]
+        ax2.plot(valid_score_xs, valid_score_ys, color=score_color,
+                 linewidth=1.0, linestyle=":", zorder=3, label="Score")
+        ax2.set_ylim(0, 1.05)
+        ax2.set_ylabel("Quality Score", color=score_color, fontsize=9)
+        ax2.tick_params(axis="y", labelcolor=score_color)
+
+        ax1.set_ylabel(primary_label, color=primary_color, fontsize=9)
+        ax1.tick_params(axis="y", labelcolor=primary_color)
+        ax1.set_xlabel("Observation time" if use_time else "Frame index", fontsize=9)
+        title = f"Quality Trend — {filter_name}" if filter_name else "Quality Trend"
+        ax1.set_title(title, fontsize=10)
+        ax1.grid(axis="both", alpha=0.2)
+
+        if use_time:
+            fig.autofmt_xdate()
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right")
+
+        plt.tight_layout()
+        img = _make_plot_base64(fig)
+        plt.close(fig)
+        return img
+    except Exception as exc:
+        logger.warning("Failed to generate quality trend plot: %s", exc)
+        return None
 
 
 def _plot_fwhm_distribution(
@@ -340,11 +465,92 @@ def _format_cell(value, precision: int = 3) -> str:
     return f'<td data-value="{value}">{value}</td>'
 
 
+def _scoring_info_html(results: List[FrameResult], weights: Optional[ScoringWeights]) -> str:
+    """
+    Return an HTML snippet describing the evaluation mode and scoring equation
+    with the actual weights used.
+    """
+    if not results:
+        return ""
+
+    w = weights or ScoringWeights()
+    mode = results[0].metrics.mode
+
+    # Determine mode label and build equation terms
+    if mode == "gas":
+        mode_label = "Gas / Narrowband"
+        mode_color = "#8e44ad"
+        terms = []
+        if w.gas_snr:
+            terms.append(f'<span class="eq-term">{w.gas_snr:.2f} × norm(snr_estimate)</span>')
+        if w.gas_noise:
+            terms.append(f'<span class="eq-term">{w.gas_noise:.2f} × (1 − norm(background_rms))</span>')
+        if w.gas_bg:
+            terms.append(f'<span class="eq-term">{w.gas_bg:.2f} × (1 − norm(background_median))</span>')
+        if w.gas_stars:
+            terms.append(f'<span class="eq-term">{w.gas_stars:.2f} × norm(n_stars)</span>')
+        if w.gas_psfsw:
+            terms.append(f'<span class="eq-term">{w.gas_psfsw:.2f} × norm(psf_signal_weight)</span>')
+        desc = (
+            "Optimised for faint emission nebulae. snr_estimate and background_rms are the primary "
+            "quality discriminators. psf_signal_weight adds a star-sharpness bonus. "
+            "n_stars is used as a sky-transparency proxy."
+        )
+    else:
+        mode_label = "Star / Broadband"
+        mode_color = "#2980b9"
+        terms = []
+        if w.star_fwhm:
+            terms.append(f'<span class="eq-term">{w.star_fwhm:.2f} × (1 − norm(fwhm_median))</span>')
+        if w.star_ecc:
+            terms.append(f'<span class="eq-term">{w.star_ecc:.2f} × (1 − norm(eccentricity_median))</span>')
+        if w.star_stars:
+            terms.append(f'<span class="eq-term">{w.star_stars:.2f} × norm(n_stars)</span>')
+        if w.star_psfsw:
+            terms.append(f'<span class="eq-term">{w.star_psfsw:.2f} × norm(psf_signal_weight)</span>')
+        if w.star_snr:
+            terms.append(f'<span class="eq-term">{w.star_snr:.2f} × norm(snr_weight)</span>')
+        desc = (
+            "Optimised for broadband / RGB imaging. psf_signal_weight combines star amplitude, "
+            "noise, and fwhm² in one metric. fwhm_median adds an independent linear seeing penalty."
+        )
+
+    total_w = sum([
+        w.gas_snr, w.gas_noise, w.gas_bg, w.gas_stars, w.gas_psfsw,
+    ] if mode == "gas" else [
+        w.star_fwhm, w.star_ecc, w.star_stars, w.star_psfsw, w.star_snr,
+    ])
+    weight_warn = (
+        f' <span style="color:#e74c3c;font-size:0.85em;">'
+        f'⚠ weights sum to {total_w:.2f}, not 1.0</span>'
+        if abs(total_w - 1.0) > 0.01 else ""
+    )
+
+    eq_html = ' <span class="eq-plus">+</span> '.join(terms) if terms else "—"
+
+    return f"""
+  <div class="scoring-info">
+    <div class="scoring-mode" style="border-left:4px solid {mode_color};">
+      <strong>Mode:</strong> {mode_label}
+    </div>
+    <div class="scoring-eq">
+      <strong>Score =</strong> {eq_html}{weight_warn}
+    </div>
+    <div class="scoring-desc">{desc}</div>
+    <div class="scoring-note">
+      All metrics are normalised to [0,&nbsp;1] across the session.
+      Score&nbsp;=&nbsp;1.0 is the best frame in the session;
+      trail penalties are applied multiplicatively after scoring.
+    </div>
+  </div>"""
+
+
 def generate_html_report(
     results: List[FrameResult],
     session_stats: Dict[str, SessionStats],
     output_path: str | Path,
     source_dir: Optional[str | Path] = None,
+    weights: Optional[ScoringWeights] = None,
 ) -> None:
     """
     Generate a rich HTML report with summary, per-frame table, and distribution plots.
@@ -377,10 +583,11 @@ def generate_html_report(
     }
 
     # Generate plots
-    fwhm_plot = _plot_fwhm_distribution(results)
-    star_plot = _plot_star_count_distribution(results)
+    fwhm_plot  = _plot_fwhm_distribution(results)
+    star_plot  = _plot_star_count_distribution(results)
     score_plot = _plot_score_distribution(results)
-    bg_plot = _plot_background_distribution(results)
+    bg_plot    = _plot_background_distribution(results)
+    trend_plot = _plot_quality_trend(results)
 
     def img_tag(b64: Optional[str], alt: str) -> str:
         if b64 is None:
@@ -396,6 +603,8 @@ def generate_html_report(
         _src = ""
     # Escape backslashes for embedding in a JS string literal
     source_dir_js = json.dumps(_src)
+
+    scoring_info = _scoring_info_html(results, weights)
 
     # --- Build HTML ---
     sorted_results = sorted(results, key=lambda r: r.metrics.filename)
@@ -455,6 +664,9 @@ def generate_html_report(
             f"{_format_cell(m.fwhm_median)}"
             f"{_format_cell(m.eccentricity_median)}"
             f"{_format_cell(m.snr_weight, precision=1)}"
+            f"{_format_cell(m.psf_signal_weight, precision=1)}"
+            f"{_format_cell(m.wfwhm)}"
+            f"{_format_cell(m.moffat_beta, precision=2)}"
             f"{_format_cell(m.snr_estimate)}"
             f"{_format_cell(m.background_rms, precision=1)}"
             f"{trail_cell}"
@@ -564,6 +776,21 @@ def generate_html_report(
     .flag-table {{ max-width: 400px; }}
     footer {{ color: #999; font-size: 0.8em; margin-top: 40px; padding-top: 12px;
               border-top: 1px solid #ddd; }}
+    .scoring-info {{
+      background: white; border-radius: 8px; padding: 14px 18px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.08); margin-top: 16px;
+    }}
+    .scoring-mode {{ padding: 6px 10px; margin-bottom: 10px;
+                     background: #f8f9fa; border-radius: 4px; font-size: 0.92em; }}
+    .scoring-eq {{ font-family: "SFMono-Regular", Consolas, monospace;
+                   font-size: 0.85em; line-height: 1.9; margin-bottom: 8px;
+                   background: #f8f9fa; padding: 8px 12px; border-radius: 4px; }}
+    .eq-term {{ display: inline-block; background: #e8f4fd;
+                border: 1px solid #bee3f8; border-radius: 3px;
+                padding: 1px 6px; margin: 1px; white-space: nowrap; }}
+    .eq-plus {{ color: #999; padding: 0 2px; }}
+    .scoring-desc {{ color: #555; margin-bottom: 6px; font-size: 0.88em; }}
+    .scoring-note {{ color: #999; font-size: 0.82em; font-style: italic; }}
     .frame-controls {{
       display: flex; justify-content: space-between; align-items: center;
       margin-bottom: 8px; flex-wrap: wrap; gap: 8px;
@@ -603,6 +830,8 @@ def generate_html_report(
       <thead><tr><th>Criterion</th><th>Frames Flagged</th></tr></thead>
       <tbody>{flag_rows}</tbody>
     </table>
+    <h3>Scoring</h3>
+    {scoring_info}
   </section>
 
   <section>
@@ -613,6 +842,7 @@ def generate_html_report(
       <div class="plot-box"><h3>Quality Score</h3>{img_tag(score_plot, "Score Distribution")}</div>
       <div class="plot-box"><h3>Background Noise</h3>{img_tag(bg_plot, "Background Noise Distribution")}</div>
     </div>
+    <div class="plot-box" style="margin-top:20px"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
   </section>
 
   <section>
@@ -661,6 +891,9 @@ def generate_html_report(
           <th class="sortable">FWHM (")</th>
           <th class="sortable">Ecc</th>
           <th class="sortable">SNR wt</th>
+          <th class="sortable" title="PSFSignalWeight: combines amplitude, FWHM penalty (1/FWHM²), and noise">PSFSW</th>
+          <th class="sortable" title="wFWHM = FWHM / sqrt(n_stars): lower is better (Siril metric)">wFWHM</th>
+          <th class="sortable" title="Moffat beta: atmospheric seeing index (typical 2.5–5)">β</th>
           <th class="sortable">SNR est</th>
           <th class="sortable">BG RMS</th>
           <th class="sortable">Trails</th>
@@ -892,6 +1125,7 @@ def _build_panel_html(
     results: List[FrameResult],
     session_stats: Dict[str, SessionStats],
     source_dir_js: str,
+    weights: Optional[ScoringWeights] = None,
 ) -> str:
     """
     Return the inner HTML for one filter's tab panel.
@@ -917,10 +1151,13 @@ def _build_panel_html(
         for flag, count in flag_counts.items()
     )
 
+    scoring_info = _scoring_info_html(results, weights)
+
     fwhm_plot  = _plot_fwhm_distribution(results)
     star_plot  = _plot_star_count_distribution(results)
     score_plot = _plot_score_distribution(results)
     bg_plot    = _plot_background_distribution(results)
+    trend_plot = _plot_quality_trend(results, filter_name=fid)
 
     def img_tag(b64: Optional[str], alt: str) -> str:
         if b64 is None:
@@ -979,6 +1216,9 @@ def _build_panel_html(
             f"{_format_cell(m.fwhm_median)}"
             f"{_format_cell(m.eccentricity_median)}"
             f"{_format_cell(m.snr_weight, precision=1)}"
+            f"{_format_cell(m.psf_signal_weight, precision=1)}"
+            f"{_format_cell(m.wfwhm)}"
+            f"{_format_cell(m.moffat_beta, precision=2)}"
             f"{_format_cell(m.snr_estimate)}"
             f"{_format_cell(m.background_rms, precision=1)}"
             f"{trail_cell}"
@@ -1001,6 +1241,8 @@ def _build_panel_html(
     <thead><tr><th>Criterion</th><th>Flagged</th></tr></thead>
     <tbody>{flag_rows}</tbody>
   </table>
+  <h3>Scoring</h3>
+  {scoring_info}
   <h2>Distribution Plots</h2>
   <div class="plots-grid">
     <div class="plot-box"><h3>FWHM</h3>{img_tag(fwhm_plot, "FWHM")}</div>
@@ -1008,6 +1250,7 @@ def _build_panel_html(
     <div class="plot-box"><h3>Quality Score</h3>{img_tag(score_plot, "Score")}</div>
     <div class="plot-box"><h3>Background Noise</h3>{img_tag(bg_plot, "BG Noise")}</div>
   </div>
+  <div class="plot-box" style="margin-top:20px"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
   <h2>Session Statistics</h2>
   <table class="session-table">
     <thead><tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th></tr></thead>
@@ -1049,6 +1292,9 @@ def _build_panel_html(
         <th class="sortable">FWHM (&quot;)</th>
         <th class="sortable">Ecc</th>
         <th class="sortable">SNR wt</th>
+        <th class="sortable" title="PSFSignalWeight: combines amplitude, FWHM penalty (1/FWHM²), and noise">PSFSW</th>
+        <th class="sortable" title="wFWHM = FWHM / sqrt(n_stars): lower is better (Siril metric)">wFWHM</th>
+        <th class="sortable" title="Moffat beta: atmospheric seeing index (typical 2.5–5)">β</th>
         <th class="sortable">SNR est</th>
         <th class="sortable">BG RMS</th>
         <th class="sortable">Trails</th>
@@ -1140,6 +1386,7 @@ def generate_multi_filter_html_report(
     filter_data: Dict[str, tuple],
     output_path: str | Path,
     source_dirs: Dict[str, "Path"],
+    weights: Optional[ScoringWeights] = None,
 ) -> None:
     """
     Generate a tabbed HTML report with one tab per filter plus a Summary tab.
@@ -1177,7 +1424,7 @@ def generate_multi_filter_html_report(
     for fid, (results, session_stats) in filter_data.items():
         fid_safe   = _filter_id_safe(fid)
         src_js     = json.dumps(str(Path(source_dirs.get(fid, Path())).resolve()))
-        inner_html = _build_panel_html(fid_safe, results, session_stats, src_js)
+        inner_html = _build_panel_html(fid_safe, results, session_stats, src_js, weights=weights)
         filter_panes.append(
             f'<div class="tab-pane" id="tab-{fid_safe}" style="display:none;">\n'
             f'{inner_html}\n</div>'
@@ -1247,6 +1494,21 @@ def generate_multi_filter_html_report(
     .flag-table {{ max-width: 400px; }}
     footer {{ color: #999; font-size: 0.8em; margin-top: 40px; padding-top: 12px;
               border-top: 1px solid #ddd; }}
+    .scoring-info {{
+      background: white; border-radius: 8px; padding: 14px 18px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.08); margin-top: 16px;
+    }}
+    .scoring-mode {{ padding: 6px 10px; margin-bottom: 10px;
+                     background: #f8f9fa; border-radius: 4px; font-size: 0.92em; }}
+    .scoring-eq {{ font-family: "SFMono-Regular", Consolas, monospace;
+                   font-size: 0.85em; line-height: 1.9; margin-bottom: 8px;
+                   background: #f8f9fa; padding: 8px 12px; border-radius: 4px; }}
+    .eq-term {{ display: inline-block; background: #e8f4fd;
+                border: 1px solid #bee3f8; border-radius: 3px;
+                padding: 1px 6px; margin: 1px; white-space: nowrap; }}
+    .eq-plus {{ color: #999; padding: 0 2px; }}
+    .scoring-desc {{ color: #555; margin-bottom: 6px; font-size: 0.88em; }}
+    .scoring-note {{ color: #999; font-size: 0.82em; font-style: italic; }}
     .frame-controls {{
       display: flex; justify-content: space-between; align-items: center;
       margin-bottom: 8px; flex-wrap: wrap; gap: 8px;

@@ -84,6 +84,9 @@ class FITSData:
     # Calibration status
     is_calibrated: bool = False
 
+    # Observation time (ISO-8601 string from DATE-OBS header)
+    obs_time: Optional[str] = None
+
     # Image mode derived from filter
     mode: Optional[str] = None  # 'star' or 'gas'
 
@@ -163,6 +166,7 @@ def _extract_2d(data: np.ndarray) -> np.ndarray:
 def load_fits(
     filepath: str | Path,
     focal_length_mm: float = DEFAULT_FOCAL_LENGTH_MM,
+    pixel_size_um: Optional[float] = None,
 ) -> FITSData:
     """
     Load a FITS file and return a FITSData object.
@@ -268,13 +272,13 @@ def load_fits(
             image_type = str(image_type).strip()
 
         # Pixel size: XPIXSZ (arcsec or um depending on software) vs PIXSIZE1 (um)
-        pixel_size_um: Optional[float] = None
+        header_pixel_size_um: Optional[float] = None
         for key in ("XPIXSZ", "PIXSIZE1"):
             if key in header_dict:
                 try:
                     val = float(header_dict[key])
                     if val > 0:
-                        pixel_size_um = val
+                        header_pixel_size_um = val
                         break
                 except (ValueError, TypeError):
                     pass
@@ -282,13 +286,16 @@ def load_fits(
         # Some software stores pixel size in different keys with different units;
         # XPIXSZ is typically in micrometers (e.g. 2.9 or 3.76)
         # Sanity check: pixel sizes should be between 0.5 and 30 um
-        if pixel_size_um is not None and not (0.5 <= pixel_size_um <= 30.0):
+        if header_pixel_size_um is not None and not (0.5 <= header_pixel_size_um <= 30.0):
             logger.warning(
                 "Suspicious pixel size %s um from header for %s; ignoring.",
-                pixel_size_um,
+                header_pixel_size_um,
                 filepath.name,
             )
-            pixel_size_um = None
+            header_pixel_size_um = None
+
+        # Use header value if present, else fall back to caller-supplied value
+        effective_pixel_size_um = header_pixel_size_um if header_pixel_size_um is not None else pixel_size_um
 
         # Focal length from header (override CLI default if present)
         fl_from_header: Optional[float] = None
@@ -305,8 +312,8 @@ def load_fits(
 
         # Pixel scale
         pixel_scale: Optional[float] = None
-        if pixel_size_um is not None:
-            pixel_scale = 206.265 * pixel_size_um / effective_fl
+        if effective_pixel_size_um is not None:
+            pixel_scale = 206.265 * effective_pixel_size_um / effective_fl
         elif "PIXSCALE" in header_dict:
             try:
                 pixel_scale = float(header_dict["PIXSCALE"])
@@ -329,6 +336,11 @@ def load_fits(
         if filter_name:
             mode = _detect_mode_from_filter(filter_name)
 
+        obs_time: Optional[str] = None
+        raw_obs = header_dict.get("DATE-OBS")
+        if raw_obs is not None:
+            obs_time = str(raw_obs).strip()
+
         fits_data = FITSData(
             filepath=str(filepath),
             filename=filepath.name,
@@ -339,10 +351,11 @@ def load_fits(
             ccd_temp=ccd_temp,
             instrument=instrument,
             image_type=image_type,
-            pixel_size_um=pixel_size_um,
+            pixel_size_um=effective_pixel_size_um,
             focal_length_mm=effective_fl,
             pixel_scale_arcsec=pixel_scale,
             is_calibrated=is_calibrated,
+            obs_time=obs_time,
             mode=mode,
             header=header_dict,
         )
@@ -416,6 +429,7 @@ def _xisf_get(meta: dict, *keys, cast=str, default=None):
 def load_xisf(
     filepath: str | Path,
     focal_length_mm: float = DEFAULT_FOCAL_LENGTH_MM,
+    pixel_size_um: Optional[float] = None,
 ) -> FITSData:
     """
     Load an XISF file and return a FITSData object.
@@ -514,17 +528,20 @@ def load_xisf(
     )
 
     # Pixel size (µm)
-    pixel_size_um: Optional[float] = _xisf_get(
+    header_pixel_size_um: Optional[float] = _xisf_get(
         meta,
         "XPIXSZ", "PIXSIZE1",            # FITS keywords (µm)
         "Instrument:Sensor:XPixelSize",   # XISF property (µm)
         cast=float,
     )
-    if pixel_size_um is not None and not (0.5 <= pixel_size_um <= 30.0):
+    if header_pixel_size_um is not None and not (0.5 <= header_pixel_size_um <= 30.0):
         logger.warning(
-            "Suspicious pixel size %.2f µm in %s; ignoring.", pixel_size_um, filepath.name
+            "Suspicious pixel size %.2f µm in %s; ignoring.", header_pixel_size_um, filepath.name
         )
-        pixel_size_um = None
+        header_pixel_size_um = None
+
+    # Use header value if present, else fall back to caller-supplied value
+    effective_pixel_size_um = header_pixel_size_um if header_pixel_size_um is not None else pixel_size_um
 
     # Focal length — XISF native property stores it in METERS; FITS keyword in mm
     fl_from_header: Optional[float] = _xisf_get(
@@ -542,8 +559,8 @@ def load_xisf(
 
     # Pixel scale
     pixel_scale: Optional[float] = None
-    if pixel_size_um is not None:
-        pixel_scale = 206.265 * pixel_size_um / effective_fl
+    if effective_pixel_size_um is not None:
+        pixel_scale = 206.265 * effective_pixel_size_um / effective_fl
     else:
         pixel_scale = _xisf_get(meta, "PIXSCALE", cast=float)
 
@@ -567,6 +584,15 @@ def load_xisf(
             except AttributeError:
                 header_dict[k] = v
 
+    obs_time: Optional[str] = _xisf_get(
+        meta,
+        "DATE-OBS",
+        "Observation:Time:Start",
+        cast=str,
+    )
+    if obs_time:
+        obs_time = obs_time.strip()
+
     fits_data = FITSData(
         filepath=str(filepath),
         filename=filepath.name,
@@ -577,10 +603,11 @@ def load_xisf(
         ccd_temp=ccd_temp,
         instrument=instrument,
         image_type=image_type,
-        pixel_size_um=pixel_size_um,
+        pixel_size_um=effective_pixel_size_um,
         focal_length_mm=effective_fl,
         pixel_scale_arcsec=pixel_scale,
         is_calibrated=is_calibrated,
+        obs_time=obs_time,
         mode=mode,
         header=header_dict,
     )
@@ -598,6 +625,7 @@ def load_xisf(
 def load_image(
     filepath: str | Path,
     focal_length_mm: float = DEFAULT_FOCAL_LENGTH_MM,
+    pixel_size_um: Optional[float] = None,
 ) -> FITSData:
     """
     Load a FITS or XISF image file, dispatching by extension.
@@ -606,8 +634,8 @@ def load_image(
     """
     filepath = Path(filepath)
     if filepath.suffix.lower() == ".xisf":
-        return load_xisf(filepath, focal_length_mm=focal_length_mm)
-    return load_fits(filepath, focal_length_mm=focal_length_mm)
+        return load_xisf(filepath, focal_length_mm=focal_length_mm, pixel_size_um=pixel_size_um)
+    return load_fits(filepath, focal_length_mm=focal_length_mm, pixel_size_um=pixel_size_um)
 
 
 def find_fits_files(directory: str | Path) -> list[Path]:

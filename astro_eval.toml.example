@@ -1,0 +1,88 @@
+# astro_eval.toml — configuration file for astro-eval
+#
+# Copy this file to astro_eval.toml in your session directory (or the current
+# working directory) and edit as needed.  All fields are optional — omit any
+# entry to keep the built-in default.
+#
+# CLI arguments always override values set here.
+
+# ---------------------------------------------------------------------------
+# Telescope
+# ---------------------------------------------------------------------------
+
+[telescope]
+focal_length_mm = 250.0          # William Optics Redcat 51
+
+
+# ---------------------------------------------------------------------------
+# Camera
+# ---------------------------------------------------------------------------
+
+[camera]
+# pixel_size_um = 3.76           # QHY MiniCam 8M
+#                                # Set this only if your FITS headers don't
+#                                # contain XPIXSZ or PIXSIZE1.
+
+
+# ---------------------------------------------------------------------------
+# Processing
+# ---------------------------------------------------------------------------
+
+[processing]
+mode                = "auto"     # "star" | "gas" | "auto"
+detection_threshold = 5.0        # star detection SNR threshold (sigma above background)
+workers             = 0          # parallel workers; 0 = all CPU cores
+
+
+# ---------------------------------------------------------------------------
+# Rejection thresholds
+# ---------------------------------------------------------------------------
+
+[rejection]
+fwhm_threshold_arcsec = 5.0      # hard FWHM limit (arcsec); frames above this are always rejected
+ecc_threshold         = 0.5      # max eccentricity [0–1]; 0=round, 1=elongated
+star_count_fraction   = 0.7      # reject if star count < session_median × this value
+snr_fraction          = 0.5      # reject if SNR < session_median × this value
+
+sigma_fwhm     = 2.0             # reject if FWHM     > session_median + sigma × std
+sigma_noise    = 2.5             # reject if noise    > session_median + sigma × std
+sigma_bg       = 3.0             # reject if background > session_median + sigma × std
+sigma_residual = 3.0             # flag if PSF residual > session_median + sigma × std
+                                 # (informational only — does not cause rejection by itself)
+
+
+# ---------------------------------------------------------------------------
+# Scoring weights
+#
+# Weights within each section should sum to 1.0.
+# A warning is printed if they don't; scores are clipped to [0, 1] regardless.
+# ---------------------------------------------------------------------------
+
+[scoring.star]
+# Broadband / RGB scoring
+weight_fwhm  = 0.30              # lower FWHM → better (weight applied to 1 - norm_fwhm)
+weight_ecc   = 0.25              # lower eccentricity → better
+weight_stars = 0.20              # more stars → better
+weight_psfsw = 0.25              # PSFSignalWeight: amplitude+noise+FWHM² combined metric
+# weight_snr = 0.00             # legacy SNR weight; disabled by default (PSFSignalWeight supersedes it)
+                                 # set to a positive value if PSF fitting is unreliable in your data
+
+[scoring.gas]
+# Narrowband / SHO scoring
+weight_snr   = 0.30              # higher SNR → better (reduced; PSFSignalWeight captures some SNR info)
+weight_noise = 0.20              # lower background noise → better
+weight_bg    = 0.15              # lower background level → better
+weight_stars = 0.20              # more stars → better (transparency proxy)
+weight_psfsw = 0.15              # PSFSignalWeight: star amplitude×SNR×1/FWHM² — partial seeing proxy
+
+
+# ---------------------------------------------------------------------------
+# Output defaults
+# (CLI flags --html, --serve, --port, --verbose still override these)
+# ---------------------------------------------------------------------------
+
+[output]
+html    = false
+serve   = false
+port    = 7420
+verbose = false
