@@ -859,14 +859,14 @@ def _watch_loop(
                         if metrics:
                             stats, results = evaluate_session(metrics, config, weights)
                             filter_data[fid] = (results, stats)
-                    generate_multi_filter_html_report(filter_data, html_path, input_dirs, weights=weights)
+                    generate_multi_filter_html_report(filter_data, html_path, input_dirs, weights=weights, config=config)
                 else:
                     fid = next(iter(filter_metrics))
                     metrics = filter_metrics[fid]
                     if metrics:
                         stats, results = evaluate_session(metrics, config, weights)
                         generate_html_report(results, stats, html_path,
-                                             source_dir=input_dirs[fid], weights=weights)
+                                             source_dir=input_dirs[fid], weights=weights, config=config)
                         generate_csv_report(results, csv_path)
 
                 broadcaster.broadcast("reload")
@@ -1151,7 +1151,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"CSV report: {fp}")
 
         if args.html or args.serve:
-            generate_multi_filter_html_report(filter_data, html_path, filter_dirs, weights=weights)
+            generate_multi_filter_html_report(filter_data, html_path, filter_dirs, weights=weights, config=config)
             print(f"HTML report: {html_path}")
 
         # Summary to stdout
@@ -1183,7 +1183,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"CSV report: {csv_path}")
 
         if args.html or args.serve:
-            generate_html_report(results, session_stats, html_path, source_dir=input_dir, weights=weights)
+            generate_html_report(results, session_stats, html_path, source_dir=input_dir, weights=weights, config=config)
             print(f"HTML report: {html_path}")
 
         # Summary to stdout

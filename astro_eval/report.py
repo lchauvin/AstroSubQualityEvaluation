@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .metrics import FrameMetrics, ScoringWeights
+from .metrics import EvalConfig, FrameMetrics, ScoringWeights
 from .scoring import FrameResult, SessionStats
 
 logger = logging.getLogger(__name__)
@@ -552,12 +552,52 @@ def _scoring_info_html(results: List[FrameResult], weights: Optional[ScoringWeig
   </div>"""
 
 
+def _rejection_threshold_str(
+    name: str,
+    ss: SessionStats,
+    config: EvalConfig,
+    mode: str,
+) -> str:
+    """Return a human-readable rejection threshold string for a session-stats metric."""
+    if not math.isfinite(ss.median) or not math.isfinite(ss.std):
+        return "—"
+    m, s = ss.median, ss.std
+
+    if name == "fwhm_median":
+        stat_t = m + config.sigma_fwhm * s
+        parts = [f"reject &gt; {stat_t:.2f}&quot; (stat)"]
+        if config.fwhm_threshold_arcsec > 0:
+            parts.append(f"&gt; {config.fwhm_threshold_arcsec:.1f}&quot; (abs)")
+        return " or ".join(parts)
+    if name == "eccentricity_median":
+        return f"reject &gt; {config.ecc_threshold:.2f}"
+    if name == "n_stars":
+        return f"reject &lt; {m * config.star_count_fraction:.0f} (stat)"
+    if name == "snr_weight" and mode != "gas":
+        return f"reject &lt; {m * config.snr_fraction:.3g} (stat)"
+    if name == "psf_residual_median":
+        return f"flag &gt; {m + config.sigma_residual * s:.4g} (stat, soft)"
+    if name == "background_rms":
+        return f"reject &gt; {m + config.sigma_noise * s:.4g} (stat)"
+    if name == "background_median":
+        return f"reject &gt; {m + config.sigma_bg * s:.4g} (stat)"
+    if name == "snr_estimate" and mode == "gas":
+        return f"reject &lt; {m * config.snr_fraction:.3g} (stat)"
+    if name == "background_gradient":
+        parts = [f"reject &gt; {m + config.sigma_gradient * s:.2f} (stat)"]
+        if config.gradient_threshold > 0:
+            parts.append(f"&gt; {config.gradient_threshold:.0f} (abs)")
+        return " or ".join(parts)
+    return "—"
+
+
 def generate_html_report(
     results: List[FrameResult],
     session_stats: Dict[str, SessionStats],
     output_path: str | Path,
     source_dir: Optional[str | Path] = None,
     weights: Optional[ScoringWeights] = None,
+    config: Optional[EvalConfig] = None,
 ) -> None:
     """
     Generate a rich HTML report with summary, per-frame table, and distribution plots.
@@ -691,10 +731,12 @@ def generate_html_report(
     )
 
     # Session stats table
+    mode = results[0].metrics.mode if results else "star"
     stat_rows = []
     for name, ss in session_stats.items():
         if ss.count == 0:
             continue
+        thresh = _rejection_threshold_str(name, ss, config, mode) if config else "—"
         stat_rows.append(
             f"<tr>"
             f"<td>{name}</td>"
@@ -703,7 +745,14 @@ def generate_html_report(
             f"<td>{ss.std:.4g}</td>"
             f"<td>{ss.min_val:.4g}</td>"
             f"<td>{ss.max_val:.4g}</td>"
+            f"<td>{thresh}</td>"
             "</tr>\n"
+        )
+    if config and config.min_score > 0:
+        stat_rows.append(
+            f"<tr><td>score</td><td>{len(results)}</td>"
+            f"<td>—</td><td>—</td><td>—</td><td>—</td>"
+            f"<td>reject &lt; {config.min_score:.2f}</td></tr>\n"
         )
 
     html = f"""<!DOCTYPE html>
@@ -857,7 +906,7 @@ def generate_html_report(
     <h2>Session Statistics</h2>
     <table class="session-table">
       <thead>
-        <tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th></tr>
+        <tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th><th>Rejection threshold</th></tr>
       </thead>
       <tbody>{"".join(stat_rows)}</tbody>
     </table>
@@ -1135,6 +1184,7 @@ def _build_panel_html(
     session_stats: Dict[str, SessionStats],
     source_dir_js: str,
     weights: Optional[ScoringWeights] = None,
+    config: Optional[EvalConfig] = None,
 ) -> str:
     """
     Return the inner HTML for one filter's tab panel.
@@ -1173,13 +1223,22 @@ def _build_panel_html(
             return f'<p class="no-data">No data for {alt}</p>'
         return f'<img src="data:image/png;base64,{b64}" alt="{alt}" style="max-width:100%;">'
 
+    mode = results[0].metrics.mode if results else "star"
     stat_rows = []
     for name, ss in session_stats.items():
         if ss.count == 0:
             continue
+        thresh = _rejection_threshold_str(name, ss, config, mode) if config else "—"
         stat_rows.append(
             f"<tr><td>{name}</td><td>{ss.count}</td><td>{ss.median:.4g}</td>"
-            f"<td>{ss.std:.4g}</td><td>{ss.min_val:.4g}</td><td>{ss.max_val:.4g}</td></tr>\n"
+            f"<td>{ss.std:.4g}</td><td>{ss.min_val:.4g}</td><td>{ss.max_val:.4g}</td>"
+            f"<td>{thresh}</td></tr>\n"
+        )
+    if config and config.min_score > 0:
+        stat_rows.append(
+            f"<tr><td>score</td><td>{len(results)}</td>"
+            f"<td>—</td><td>—</td><td>—</td><td>—</td>"
+            f"<td>reject &lt; {config.min_score:.2f}</td></tr>\n"
         )
 
     sorted_results = sorted(results, key=lambda r: r.metrics.filename)
@@ -1263,7 +1322,7 @@ def _build_panel_html(
   <div class="plot-box" style="margin-top:20px"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
   <h2>Session Statistics</h2>
   <table class="session-table">
-    <thead><tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th></tr></thead>
+    <thead><tr><th>Metric</th><th>N</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th><th>Rejection threshold</th></tr></thead>
     <tbody>{"".join(stat_rows)}</tbody>
   </table>
   <h2>Per-Frame Results</h2>
@@ -1398,6 +1457,7 @@ def generate_multi_filter_html_report(
     output_path: str | Path,
     source_dirs: Dict[str, "Path"],
     weights: Optional[ScoringWeights] = None,
+    config: Optional[EvalConfig] = None,
 ) -> None:
     """
     Generate a tabbed HTML report with one tab per filter plus a Summary tab.
@@ -1435,7 +1495,7 @@ def generate_multi_filter_html_report(
     for fid, (results, session_stats) in filter_data.items():
         fid_safe   = _filter_id_safe(fid)
         src_js     = json.dumps(str(Path(source_dirs.get(fid, Path())).resolve()))
-        inner_html = _build_panel_html(fid_safe, results, session_stats, src_js, weights=weights)
+        inner_html = _build_panel_html(fid_safe, results, session_stats, src_js, weights=weights, config=config)
         filter_panes.append(
             f'<div class="tab-pane" id="tab-{fid_safe}" style="display:none;">\n'
             f'{inner_html}\n</div>'
