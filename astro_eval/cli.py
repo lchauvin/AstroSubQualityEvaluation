@@ -544,8 +544,8 @@ def _make_server(
     handler = _make_handler(html_path, source_dirs, broadcaster)
     for p in range(port, port + 20):
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", p), handler)
-            return server, f"http://127.0.0.1:{p}/"
+            server = ThreadingHTTPServer(("0.0.0.0", p), handler)
+            return server, f"http://localhost:{p}/"
         except OSError:
             continue
     return None, ""
