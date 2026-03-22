@@ -58,6 +58,7 @@ Example config (all fields optional):
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -81,8 +82,32 @@ else:
 
 
 def find_config_file(input_dir: Path) -> Optional[Path]:
-    """Search for astro_eval.toml in input_dir then cwd. Returns first found path."""
-    for candidate in [input_dir / "astro_eval.toml", Path.cwd() / "astro_eval.toml"]:
+    """
+    Search for astro_eval.toml in order of priority. Returns first found path.
+
+    Search order:
+      1. INPUT_DIR/astro_eval.toml          (session-specific override)
+      2. %APPDATA%/astro-eval/astro_eval.toml  (user global config, Windows)
+         ~/.config/astro_eval/astro_eval.toml  (user global config, Linux/macOS)
+      3. Directory of the running executable  (install dir, useful for frozen builds)
+      4. cwd/astro_eval.toml                 (fallback for dev usage)
+    """
+    candidates: list[Path] = [input_dir / "astro_eval.toml"]
+
+    # User-level global config
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "astro-eval" / "astro_eval.toml")
+    else:
+        candidates.append(Path.home() / ".config" / "astro_eval" / "astro_eval.toml")
+
+    # Next to the executable (works for both frozen PyInstaller builds and editable installs)
+    candidates.append(Path(sys.executable).parent / "astro_eval.toml")
+
+    # CWD fallback (useful during development)
+    candidates.append(Path.cwd() / "astro_eval.toml")
+
+    for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None

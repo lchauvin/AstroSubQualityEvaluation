@@ -17,6 +17,19 @@ If your camera doesn't write pixel size to FITS headers, set `pixel_size_um` in 
 
 ## Installation
 
+### Windows — Installer (recommended)
+
+Download `astro-eval-setup.exe` from the [Releases](../../releases) page and run it. The installer:
+
+- Installs astro-eval to `%LocalAppData%\Programs\astro-eval\` (no administrator rights required)
+- Adds `astro-eval` to your user PATH so it works from any Command Prompt
+- Adds a **"Analyze with astro-eval"** entry to the right-click context menu on folders in Windows Explorer
+- Places a ready-to-use configuration file at `%APPDATA%\astro-eval\astro_eval.toml`
+
+After installing, right-click any folder containing FITS/XISF files and choose **Analyze with astro-eval**. The report opens automatically in your browser.
+
+### Developer / Python install
+
 ```bash
 pip install -e .
 ```
@@ -32,6 +45,16 @@ pip install -e .
 | `matplotlib` | Distribution plots in HTML report |
 | `xisf` | XISF file format support |
 | `paramiko` | SFTP remote file pull (`--remote`) |
+
+### Building the installer from source
+
+Requires [uv](https://docs.astral.sh/uv/) and [Inno Setup 6](https://jrsoftware.org/isinfo.php).
+
+```bat
+build.bat
+```
+
+Produces `Output\astro-eval-setup.exe`.
 
 ## Quick Start
 
@@ -135,16 +158,18 @@ icacls "C:\ProgramData\ssh\administrators_authorized_keys" /inheritance:r /grant
 
 All CLI options can also be set in a TOML config file, making it easy to store per-scope or per-session defaults. CLI arguments always override the config file.
 
-**Search order:**
+**Search order** (first file found wins):
 1. `--config FILE` (explicit path)
-2. `INPUT_DIR/astro_eval.toml`
-3. `./astro_eval.toml` (current working directory)
+2. `INPUT_DIR/astro_eval.toml` — session-specific override
+3. `%APPDATA%\astro-eval\astro_eval.toml` — user global config (Windows)
+   `~/.config/astro_eval/astro_eval.toml` — user global config (Linux/macOS)
+4. Next to the executable — install directory fallback
+5. Current working directory
 
-Copy and edit the provided example:
+**The installer places a ready-to-use config at `%APPDATA%\astro-eval\astro_eval.toml`.**
+Edit it once to set your telescope and camera defaults — it will be picked up automatically for every session without copying anything.
 
-```bash
-cp astro_eval.toml.example /path/to/session/astro_eval.toml
-```
+To override settings for a specific session, drop an `astro_eval.toml` directly in the FITS folder.
 
 Key sections:
 

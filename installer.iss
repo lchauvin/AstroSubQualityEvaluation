@@ -43,7 +43,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; Main application directory (all PyInstaller output)
 Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-; Example config file
+; Global user config — installed to %APPDATA%\astro-eval\astro_eval.toml
+; onlyifdoesntexist: never overwrite a config the user has already customised
+Source: "astro_eval.toml.example"; DestDir: "{userappdata}\astro-eval"; DestName: "astro_eval.toml"; Flags: ignoreversion onlyifdoesntexist
+
+; Keep the example in the install dir for reference
 Source: "astro_eval.toml.example"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -87,4 +91,4 @@ Filename: "cmd.exe"; Parameters: "/k ""{app}\{#AppExeName}"" --help"; Descriptio
 ; Nothing extra needed — registry entries marked with uninsdeletekey are auto-removed
 
 [Messages]
-FinishedLabel=astro-eval has been installed.%n%nRight-click any folder in Windows Explorer and choose "Analyze with astro-eval" to start analyzing your astrophotography sub-frames.%n%nYou can also run "astro-eval --help" from any Command Prompt.
+FinishedLabel=astro-eval has been installed.%n%nRight-click any folder in Windows Explorer and choose "Analyze with astro-eval" to start.%n%nYour configuration file is at:%n  %APPDATA%\astro-eval\astro_eval.toml%n%nEdit it once to set your telescope focal length, camera pixel size, and rejection thresholds. You can also drop an astro_eval.toml in any specific session folder to override settings for that session.
