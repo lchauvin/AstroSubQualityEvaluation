@@ -440,6 +440,37 @@ Satellite and airplane trails are detected automatically:
 
 Detection uses PCA on connected components in a downsampled, background-suppressed image, followed by perpendicular cross-section analysis to distinguish single vs double trails.
 
+## Siril Integration
+
+A pySiril script is included (`astro_eval_siril.py`) for users who process their data in [Siril](https://siril.org/). It runs astro-eval from within Siril and automatically deselects rejected frames in the loaded sequence.
+
+**Requirements:** Siril 1.4+, astro-eval installed via the Windows installer.
+
+**Usage:**
+
+In Siril's script console:
+```
+pyscript C:\Users\YourName\AppData\Local\Programs\astro-eval\astro_eval_siril.py
+```
+
+Or add the install directory to Siril's script search paths in Siril preferences, then simply:
+```
+pyscript astro_eval_siril.py
+```
+
+**What it does:**
+
+1. Opens a folder picker dialog (pre-filled with Siril's current working directory)
+2. Runs `astro-eval <folder> --html` — the full evaluation pipeline runs exactly as from the command line
+3. Parses the CSV report to identify rejected frames
+4. If a sequence is loaded, deselects rejected frames (so they are excluded from stacking)
+5. Opens the HTML quality report in your browser
+6. Logs a summary (accepted/rejected counts) in Siril's log panel
+
+**Multi-filter sessions** are handled automatically — all per-filter CSV reports (`astro_eval_report_Ha.csv`, etc.) are parsed.
+
+The script does not modify astro-eval's processing in any way — it is a pure wrapper that calls the exe and acts on its output.
+
 ## Technical Notes
 
 - **Minimum frames:** Session statistics require at least 3 frames for reliable thresholds.

@@ -50,6 +50,9 @@ Source: "astro_eval.toml.example"; DestDir: "{userappdata}\astro-eval"; DestName
 ; Keep the example in the install dir for reference
 Source: "astro_eval.toml.example"; DestDir: "{app}"; Flags: ignoreversion
 
+; Siril integration script
+Source: "astro_eval_siril.py"; DestDir: "{app}"; Flags: ignoreversion
+
 [Icons]
 ; Start Menu shortcut — opens a terminal in the install directory
 Name: "{group}\astro-eval (Command Prompt)"; Filename: "cmd.exe"; Parameters: "/k ""{app}\{#AppExeName}"" --help"; WorkingDir: "{app}"
