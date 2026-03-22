@@ -322,6 +322,55 @@ Self-contained HTML file (no external dependencies) including:
 
 **PSFSignalWeight, wFWHM, Moffat β, FWHM, Eccentricity** — PSF fitting is also run in gas mode (same algorithm as star mode). These metrics are populated in the CSV/HTML output and `psf_signal_weight` contributes to the Gas Score (weight 0.15). They are informational in the context of narrowband imaging — star shape doesn't affect nebula detail — but help discriminate between otherwise similar frames and catch severe tracking or focus issues.
 
+### Reading the Session Statistics
+
+The console summary prints session-level statistics for each metric. Each row is a per-frame measurement; the columns (median, mean, std, min, max) describe how that measurement varies **across all frames** in the session. The row and column together answer a specific diagnostic question.
+
+#### Seeing and focus
+
+| Row | Column | Diagnostic question |
+|-----|--------|---------------------|
+| `fwhm_median` | `median` | What was the typical seeing this session? |
+| `fwhm_median` | `std` | Did seeing stay stable, or did it drift during the night? High std = unstable atmosphere. |
+| `fwhm_mean` | `std` | Same as above, slightly more sensitive to frames with a few very blurry outlier stars. |
+| `fwhm_std` | `median` | Within a typical frame, how consistent are star sizes across the field? High = field curvature, sensor tilt, or anisoplanatic seeing. |
+| `fwhm_std` | `std` | Did the across-field PSF spread change between frames? High = focus drift or temperature-induced flexure during the session. |
+| `moffat_beta` | `median` | Typical atmospheric profile shape (β ≈ 2.5 = poor seeing, β ≈ 4–5 = good seeing). |
+| `moffat_beta` | `std` | Were atmospheric conditions steady, or did the turbulence profile keep changing? |
+| `wfwhm` | `median` | Combined seeing + transparency quality for the session (lower is better). |
+
+#### Tracking and guiding
+
+| Row | Column | Diagnostic question |
+|-----|--------|---------------------|
+| `eccentricity_median` | `median` | How well did tracking/guiding perform on average? |
+| `eccentricity_median` | `std` | Were there isolated tracking failures, or was guiding consistently poor? High std with low median = occasional wind gusts or guide star lost briefly. |
+| `psf_residual_median` | `median` | How well does a Moffat profile fit the stars? High = distorted PSF from aberrations, coma, or trailing. |
+| `psf_residual_median` | `std` | Was the PSF distortion consistent (optical issue) or intermittent (tracking or wind)? |
+
+#### Sky and transparency
+
+| Row | Column | Diagnostic question |
+|-----|--------|---------------------|
+| `n_stars` | `median` | How transparent was the sky on average? |
+| `n_stars` | `std` | Did transparency fluctuate? High std = passing clouds or variable extinction. |
+| `background_median` | `median` | Typical sky brightness level (ADU) — driven by light pollution and moon. |
+| `background_median` | `std` | Did sky brightness change during the session? High std = moonrise/set or worsening LP. |
+| `background_rms` | `median` | Typical noise floor for the session. |
+| `background_rms` | `std` | How stable was the noise floor? High std = variable sky conditions. |
+| `background_gradient` | `median` | Typical gradient severity — how uneven the sky background is across the frame. |
+| `background_gradient` | `std` | Were gradients consistent (persistent LP source) or spiky (cloud edges, twilight encroachment)? |
+
+#### Signal quality
+
+| Row | Column | Diagnostic question |
+|-----|--------|---------------------|
+| `psf_signal_weight` | `median` | Typical combined signal quality (amplitude × sharpness) for the session. |
+| `psf_signal_weight` | `std` | Did signal quality vary? High std = intermittent clouds or transparency loss in some frames. |
+| `snr_weight` | `median` | Typical raw SNR proxy (flux² / noise²). Less sensitive to FWHM than PSFSignalWeight. |
+| `snr_estimate` | `median` | (Gas mode) Typical nebula signal level above background. |
+| `snr_estimate` | `std` | (Gas mode) Was the nebula signal stable, or did sky conditions affect it frame to frame? |
+
 ## Scoring
 
 ### Star Score
