@@ -166,6 +166,80 @@ def generate_csv_report(
     logger.info("CSV report written to %s", output_path)
 
 
+# PixInsight SubFrameSelector columns (compatible with SFS 1.48+)
+_SFS_COLUMNS = [
+    "Index", "File", "Enabled", "Weight",
+    "FWHM", "Eccentricity", "SNRWeight", "Median", "MeanDeviation", "Noise",
+    "StarSupport", "StarResidual", "NoiseSupport",
+    "FWHMHigh", "EccentricityHigh", "SNRWeightLow",
+    "MedianHigh", "MeanDeviationHigh", "NoiseHigh",
+]
+
+
+def generate_subframeselector_csv(
+    results: List[FrameResult],
+    output_path: str | Path,
+) -> None:
+    """
+    Export evaluation results in PixInsight SubFrameSelector CSV format.
+
+    The Weight column uses the astro-eval composite quality score (0–1).
+    Enabled is set to 0 for rejected frames, 1 for accepted.
+    All numeric columns use the values computed by astro-eval where available;
+    fields not directly computed (MeanDeviation, NoiseSupport) are set to 0.
+
+    Parameters
+    ----------
+    results:
+        List of FrameResult objects from evaluate_session().
+    output_path:
+        Path to the output CSV file.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    sorted_results = sorted(results, key=lambda r: r.metrics.filename)
+
+    with open(output_path, "w", newline="", encoding="utf-8", errors="replace") as f:
+        writer = csv.DictWriter(f, fieldnames=_SFS_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for i, result in enumerate(sorted_results, 1):
+            m = result.metrics
+            r = result.rejection
+            enabled = 0 if r.rejected else 1
+            weight = result.score if math.isfinite(result.score) else 0.0
+            fwhm = m.fwhm_median if math.isfinite(m.fwhm_median) else 0.0
+            ecc = m.eccentricity_median if math.isfinite(m.eccentricity_median) else 0.0
+            snr_weight = m.snr_weight if math.isfinite(m.snr_weight) else 0.0
+            bg_median = m.background_median if math.isfinite(m.background_median) else 0.0
+            noise = m.background_rms if math.isfinite(m.background_rms) else 0.0
+            star_support = m.n_stars
+            star_residual = m.psf_residual_median if math.isfinite(m.psf_residual_median) else 0.0
+            writer.writerow({
+                "Index": i,
+                "File": m.filepath,
+                "Enabled": enabled,
+                "Weight": f"{weight:.6f}",
+                "FWHM": f"{fwhm:.4f}",
+                "Eccentricity": f"{ecc:.4f}",
+                "SNRWeight": f"{snr_weight:.4f}",
+                "Median": f"{bg_median:.2f}",
+                "MeanDeviation": "0",
+                "Noise": f"{noise:.4f}",
+                "StarSupport": star_support,
+                "StarResidual": f"{star_residual:.6f}",
+                "NoiseSupport": "0",
+                "FWHMHigh": 1 if r.flags.get("high_fwhm") else 0,
+                "EccentricityHigh": 1 if r.flags.get("high_eccentricity") else 0,
+                "SNRWeightLow": 1 if r.flags.get("low_snr_weight") else 0,
+                "MedianHigh": 1 if r.flags.get("high_background") else 0,
+                "MeanDeviationHigh": 0,
+                "NoiseHigh": 1 if r.flags.get("high_noise") else 0,
+            })
+
+    logger.info("SubFrameSelector CSV written to %s", output_path)
+
+
 # ---------------------------------------------------------------------------
 # HTML report
 # ---------------------------------------------------------------------------
@@ -190,6 +264,402 @@ def _parse_obs_time(s: Optional[str]):
             continue
     return None
 
+
+# ---------------------------------------------------------------------------
+# Per-frame FWHM spatial heatmap (SVG)
+# ---------------------------------------------------------------------------
+
+def _fwhm_heatmap_svg(
+    fwhm_map: Optional[List[List[float]]],
+    global_min: float,
+    global_max: float,
+    cell_px: int = 9,
+) -> str:
+    """
+    Return an inline SVG string for a 5×5 FWHM spatial heatmap cell.
+
+    Color scale: green (low FWHM = good seeing) → red (high FWHM = bad seeing).
+    Gray cells have no star data. Normalised against global_min/global_max so
+    all frames in the session use a consistent color scale.
+
+    Returns '—' string if fwhm_map is None.
+    """
+    if fwhm_map is None:
+        return "—"
+
+    grid = len(fwhm_map)
+    size = grid * cell_px
+    rng = global_max - global_min if global_max > global_min else 1.0
+
+    def cell_color(v: float) -> str:
+        if not math.isfinite(v):
+            return "#cccccc"
+        t = max(0.0, min(1.0, (v - global_min) / rng))
+        # green → yellow → red
+        r = int(min(255, t * 2 * 255))
+        g = int(min(255, (1 - t) * 2 * 255))
+        return f"#{r:02x}{g:02x}00"
+
+    rects = []
+    for ri, row in enumerate(fwhm_map):
+        for ci, val in enumerate(row):
+            x = ci * cell_px
+            y = ri * cell_px
+            color = cell_color(val)
+            tip = f"{val:.2f}&quot;" if math.isfinite(val) else "no data"
+            rects.append(
+                f'<rect x="{x}" y="{y}" width="{cell_px}" height="{cell_px}" '
+                f'fill="{color}"><title>{tip}</title></rect>'
+            )
+
+    return (
+        f'<svg width="{size}" height="{size}" '
+        f'viewBox="0 0 {size} {size}" style="display:block;">'
+        + "".join(rects)
+        + "</svg>"
+    )
+
+
+def _compute_fwhm_map_global_range(results: List[FrameResult]) -> tuple:
+    """Return (global_min, global_max) FWHM map values across all frames for consistent coloring."""
+    all_vals: List[float] = []
+    for r in results:
+        if r.metrics.fwhm_map is not None:
+            for row in r.metrics.fwhm_map:
+                all_vals.extend(v for v in row if math.isfinite(v))
+    if not all_vals:
+        return 0.0, 5.0
+    return float(np.min(all_vals)), float(np.max(all_vals))
+
+
+# ---------------------------------------------------------------------------
+# Interactive chart data + JS
+# ---------------------------------------------------------------------------
+
+def _build_chart_data_json(results: List[FrameResult], prefix: str, table_id: str = "") -> str:
+    """
+    Serialize per-frame data to a JSON object consumed by the inline chart renderer.
+    """
+    ordered = sorted(results, key=lambda r: r.metrics.filename)
+    frames = []
+    for r in ordered:
+        m = r.metrics
+        frames.append({
+            "fn": m.filename,
+            "fwhm": m.fwhm_median if math.isfinite(m.fwhm_median) else None,
+            "stars": m.n_stars,
+            "score": r.score if math.isfinite(r.score) else None,
+            "bg_rms": m.background_rms if math.isfinite(m.background_rms) else None,
+            "alt": m.altitude_deg,
+            "mode": m.mode,
+            "rejected": r.rejection.rejected,
+            "flags": {k: bool(v) for k, v in r.rejection.flags.items()},
+        })
+    return json.dumps({"frames": frames, "prefix": prefix, "tableId": table_id})
+
+
+# _CHART_JS is a plain Python string (NOT an f-string) so JavaScript {braces} are preserved verbatim.
+# It is embedded into the HTML via an f-string substitution: {_CHART_JS}
+_CHART_JS = """
+(function() {
+  function px(n) { return Math.round(n * 10) / 10; }
+
+  // Adaptive x-axis frame-number labels (bar chart variant: bar centres)
+  function xAxisBars(n, ml, iW, mt, iH) {
+    var step = n <= 20 ? 1 : n <= 50 ? 5 : n <= 100 ? 10 : n <= 200 ? 20 : 50;
+    var out = '', y = mt + iH + 13;
+    for (var i = 0; i < n; i++) {
+      if (i % step === 0 || i === n - 1) {
+        var x = ml + (i + 0.5) * (iW / n);
+        out += '<text x="' + px(x) + '" y="' + y + '" fill="#888" font-size="8" text-anchor="middle">' + (i + 1) + '</text>';
+      }
+    }
+    return out;
+  }
+
+  // Adaptive x-axis frame-number labels (line chart variant: point positions)
+  function xAxisLine(n, ml, iW, mt, iH) {
+    var step = n <= 20 ? 1 : n <= 50 ? 5 : n <= 100 ? 10 : n <= 200 ? 20 : 50;
+    var out = '', y = mt + iH + 13;
+    for (var i = 0; i < n; i++) {
+      if (i % step === 0 || i === n - 1) {
+        var x = ml + i / Math.max(n - 1, 1) * iW;
+        out += '<text x="' + px(x) + '" y="' + y + '" fill="#888" font-size="8" text-anchor="middle">' + (i + 1) + '</text>';
+      }
+    }
+    return out;
+  }
+
+  // Wire up click-to-row for [data-fn] elements inside a container
+  function addClickListeners(containerId, tableId) {
+    var container = document.getElementById(containerId);
+    var table = document.getElementById(tableId);
+    if (!container || !table) return;
+    // Build filename→row lookup to avoid CSS selector escaping issues
+    var rowMap = {};
+    table.querySelectorAll('tbody tr[data-filename]').forEach(function(r) {
+      rowMap[r.getAttribute('data-filename')] = r;
+    });
+    container.querySelectorAll('[data-fn]').forEach(function(el) {
+      el.addEventListener('click', function() {
+        var fn = el.getAttribute('data-fn');
+        if (!fn) return;
+        var row = rowMap[fn];
+        if (!row) return;
+        row.scrollIntoView({behavior: 'smooth', block: 'center'});
+        var prev = row.style.outline;
+        row.style.outline = '2px solid #3498db';
+        setTimeout(function() { row.style.outline = prev; }, 1500);
+      });
+    });
+  }
+
+  // fns: array of filenames aligned with values (for data-fn on bars)
+  function makeBarChart(values, fns, colors, median, title, ylabel, W, H) {
+    W = W || 500; H = H || 260;
+    var ml = 52, mr = 16, mt = 28, mb = 36;
+    var iW = W - ml - mr, iH = H - mt - mb;
+    var n = values.length;
+    if (!n) return '<p class="no-data">No data</p>';
+    var finite = values.filter(function(v) { return v !== null && isFinite(v); });
+    if (!finite.length) return '<p class="no-data">No data</p>';
+    var maxV = Math.max.apply(null, finite) * 1.08;
+    var minV = Math.min(0, Math.min.apply(null, finite));
+    var rng = maxV - minV || 1;
+    var bW = iW / n * 0.82, gap = iW / n * 0.18;
+    var bars = '';
+    for (var i = 0; i < n; i++) {
+      var v = values[i];
+      if (v === null || !isFinite(v)) continue;
+      var x = ml + i * (iW / n) + gap / 2;
+      var bH = (v - minV) / rng * iH;
+      var y = mt + iH - bH;
+      var fn = (fns && fns[i]) ? fns[i].replace(/&/g,'&amp;').replace(/"/g,'&quot;') : '';
+      bars += '<rect x="' + px(x) + '" y="' + px(y) + '" width="' + px(bW) + '" height="' + px(bH) + '" fill="' + colors[i] + '" opacity="0.88" data-fn="' + fn + '" style="cursor:pointer;"><title>' + (typeof v === 'number' ? v.toFixed(3) : v) + '</title></rect>';
+    }
+    var med = '';
+    if (median !== null && isFinite(median)) {
+      var my = mt + iH - (median - minV) / rng * iH;
+      med = '<line x1="' + ml + '" y1="' + px(my) + '" x2="' + (ml+iW) + '" y2="' + px(my) + '" stroke="#e67e22" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.85"/><text x="' + (ml+iW-2) + '" y="' + (px(my)-3) + '" fill="#e67e22" font-size="9" text-anchor="end">med:' + median.toFixed(2) + '</text>';
+    }
+    var yticks = '';
+    for (var t = 0; t <= 4; t++) {
+      var tv = minV + (maxV - minV) * t / 4;
+      var ty = mt + iH - (tv - minV) / rng * iH;
+      yticks += '<line x1="' + (ml-3) + '" y1="' + px(ty) + '" x2="' + ml + '" y2="' + px(ty) + '" stroke="#ccc"/><text x="' + (ml-5) + '" y="' + (px(ty)+3.5) + '" fill="#888" font-size="8.5" text-anchor="end">' + tv.toFixed(2) + '</text>';
+    }
+    var xlabels = xAxisBars(n, ml, iW, mt, iH);
+    return '<svg width="100%" viewBox="0 0 ' + W + ' ' + H + '" style="font-family:sans-serif;">' +
+      '<text x="' + (W/2) + '" y="16" text-anchor="middle" font-size="11" font-weight="bold" fill="#2c3e50">' + title + '</text>' +
+      '<text x="' + px(ml-44) + '" y="' + (H/2) + '" font-size="9.5" fill="#666" text-anchor="middle" transform="rotate(-90 ' + px(ml-44) + ' ' + (H/2) + ')">' + ylabel + '</text>' +
+      '<line x1="' + ml + '" y1="' + mt + '" x2="' + ml + '" y2="' + (mt+iH) + '" stroke="#ddd"/>' +
+      '<line x1="' + ml + '" y1="' + (mt+iH) + '" x2="' + (ml+iW) + '" y2="' + (mt+iH) + '" stroke="#ddd"/>' +
+      yticks + bars + med + xlabels + '</svg>';
+  }
+
+  // fns: array of filenames aligned with primVals (for data-fn on rejected dots)
+  function makeDualLine(primVals, fns, scoreVals, rejected, title, primLabel, primColor, showMedian, W, H) {
+    W = W || 680; H = H || 260;
+    var ml = 52, mr = 52, mt = 28, mb = 36;
+    var iW = W - ml - mr, iH = H - mt - mb;
+    var n = primVals.length;
+    if (!n) return '<p class="no-data">No data</p>';
+    primColor = primColor || '#5b9bd5';
+    var sc = '#f0ad4e';
+    var pfin = primVals.filter(function(v) { return v !== null && isFinite(v); });
+    var pmax = pfin.length ? Math.max.apply(null, pfin) * 1.08 : 1;
+    var pmin = Math.min(0, pfin.length ? Math.min.apply(null, pfin) * 0.9 : 0);
+    var prng = pmax - pmin || 1;
+    function xp(i) { return ml + i / Math.max(n-1,1) * iW; }
+    function yp(v) { return mt + iH - (v - pmin) / prng * iH; }
+    function ys(v) { return mt + iH - v * iH; }
+    var pp = [], sp = [];
+    for (var i = 0; i < n; i++) {
+      if (primVals[i] !== null && isFinite(primVals[i])) pp.push(px(xp(i)) + ',' + px(yp(primVals[i])));
+      if (scoreVals[i] !== null && isFinite(scoreVals[i])) sp.push(px(xp(i)) + ',' + px(ys(scoreVals[i])));
+    }
+    var primLine = pp.length > 1 ? '<polyline points="' + pp.join(' ') + '" fill="none" stroke="' + primColor + '" stroke-width="1.5"/>' : '';
+    var scoreLine = sp.length > 1 ? '<polyline points="' + sp.join(' ') + '" fill="none" stroke="' + sc + '" stroke-width="1.2" stroke-dasharray="3,2"/>' : '';
+    var rejDots = '';
+    for (var i = 0; i < n; i++) {
+      if (rejected[i] && scoreVals[i] !== null && isFinite(scoreVals[i])) {
+        var fn = (fns && fns[i]) ? fns[i].replace(/&/g,'&amp;').replace(/"/g,'&quot;') : '';
+        rejDots += '<circle cx="' + px(xp(i)) + '" cy="' + px(ys(scoreVals[i])) + '" r="4" fill="#d9534f" opacity="0.85" data-fn="' + fn + '" style="cursor:pointer;"><title>Rejected: ' + (fns && fns[i] ? fns[i] : '') + '</title></circle>';
+      }
+    }
+    var medLine = '';
+    if (showMedian && pfin.length) {
+      var med = pfin.slice().sort(function(a,b){return a-b;}); var mi = Math.floor(med.length/2);
+      var mv = med.length%2 ? med[mi] : (med[mi-1]+med[mi])/2;
+      var my = yp(mv);
+      medLine = '<line x1="' + ml + '" y1="' + px(my) + '" x2="' + (ml+iW) + '" y2="' + px(my) + '" stroke="' + primColor + '" stroke-width="1" stroke-dasharray="4,3" opacity="0.55"/>';
+    }
+    var ytL = '', ytR = '';
+    for (var t = 0; t <= 4; t++) {
+      var tv = pmin + (pmax-pmin)*t/4, ty = yp(tv);
+      ytL += '<line x1="' + (ml-3) + '" y1="' + px(ty) + '" x2="' + ml + '" y2="' + px(ty) + '" stroke="#ccc"/><text x="' + (ml-5) + '" y="' + (px(ty)+3.5) + '" fill="' + primColor + '" font-size="8.5" text-anchor="end">' + tv.toFixed(2) + '</text>';
+      var sv = t * 0.25, sy = ys(sv);
+      ytR += '<text x="' + (ml+iW+5) + '" y="' + (px(sy)+3.5) + '" fill="' + sc + '" font-size="8.5">' + sv.toFixed(2) + '</text>';
+    }
+    var xlabels = xAxisLine(n, ml, iW, mt, iH);
+    return '<svg width="100%" viewBox="0 0 ' + W + ' ' + H + '" style="font-family:sans-serif;">' +
+      '<text x="' + (W/2) + '" y="16" text-anchor="middle" font-size="11" font-weight="bold" fill="#2c3e50">' + title + '</text>' +
+      '<text x="' + px(ml-44) + '" y="' + (H/2) + '" font-size="9.5" fill="' + primColor + '" text-anchor="middle" transform="rotate(-90 ' + px(ml-44) + ' ' + (H/2) + ')">' + primLabel + '</text>' +
+      '<text x="' + px(ml+iW+44) + '" y="' + (H/2) + '" font-size="9.5" fill="' + sc + '" text-anchor="middle" transform="rotate(90 ' + px(ml+iW+44) + ' ' + (H/2) + ')">Quality Score</text>' +
+      '<line x1="' + ml + '" y1="' + mt + '" x2="' + ml + '" y2="' + (mt+iH) + '" stroke="#ddd"/>' +
+      '<line x1="' + ml + '" y1="' + (mt+iH) + '" x2="' + (ml+iW) + '" y2="' + (mt+iH) + '" stroke="#ddd"/>' +
+      ytL + ytR + medLine + primLine + scoreLine + rejDots + xlabels + '</svg>';
+  }
+
+  function median(arr) {
+    var v = arr.filter(function(x) { return x !== null && isFinite(x); }).slice().sort(function(a,b){return a-b;});
+    if (!v.length) return null;
+    var m = Math.floor(v.length/2);
+    return v.length%2 ? v[m] : (v[m-1]+v[m])/2;
+  }
+
+  // overrideRejected: optional boolean[] aligned with DATA.frames — used by threshold sliders
+  window.renderCharts = function(DATA, prefix, overrideRejected) {
+    var frames  = DATA.frames;
+    var tableId = DATA.tableId || '';
+    var fns    = frames.map(function(f) { return f.fn; });
+    var fwhms  = frames.map(function(f) { return f.fwhm; });
+    var stars  = frames.map(function(f) { return f.stars; });
+    var scores = frames.map(function(f) { return f.score; });
+    var bgRms  = frames.map(function(f) { return f.bg_rms; });
+    var alts   = frames.map(function(f) { return f.alt !== undefined ? f.alt : null; });
+    var rej    = overrideRejected || frames.map(function(f) { return f.rejected; });
+
+    function barsFor(flagKey) {
+      return frames.map(function(f, i) {
+        return (rej[i] || (f.flags && f.flags[flagKey])) ? '#d9534f' : '#5cb85c';
+      });
+    }
+    var scoreColors = frames.map(function(f, i) {
+      return rej[i] ? '#d9534f' : (f.score < 0.5 ? '#f0ad4e' : '#5cb85c');
+    });
+
+    var charts = [
+      { id: prefix + 'chart-fwhm',  html: makeBarChart(fwhms, fns, barsFor('high_fwhm'), median(fwhms), 'FWHM Distribution', 'FWHM (arcsec)') },
+      { id: prefix + 'chart-stars', html: makeBarChart(stars, fns, barsFor('low_stars'),  median(stars), 'Star Count', 'Stars') },
+      { id: prefix + 'chart-score', html: makeBarChart(scores, fns, scoreColors,          median(scores), 'Quality Score', 'Score') },
+      { id: prefix + 'chart-bg',    html: makeBarChart(bgRms,  fns, barsFor('high_noise'), median(bgRms),  'Background Noise', 'BG RMS (ADU)') },
+    ];
+    charts.forEach(function(c) {
+      var el = document.getElementById(c.id);
+      if (el) {
+        el.innerHTML = c.html;
+        if (tableId) addClickListeners(c.id, tableId);
+      }
+    });
+
+    // Trend chart
+    var trendEl = document.getElementById(prefix + 'chart-trend');
+    if (trendEl) {
+      var isGas = frames.length && frames[0].mode === 'gas';
+      var primVals = isGas ? bgRms : fwhms;
+      var primLabel = isGas ? 'BG RMS (ADU)' : 'FWHM (arcsec)';
+      trendEl.innerHTML = makeDualLine(primVals, fns, scores, rej, 'Quality Trend Over Time', primLabel, '#5b9bd5', true);
+      if (tableId) addClickListeners(prefix + 'chart-trend', tableId);
+    }
+
+    // Altitude chart
+    var altEl = document.getElementById(prefix + 'chart-alt');
+    if (altEl) {
+      var hasAlt = alts.some(function(a) { return a !== null && isFinite(a); });
+      if (hasAlt) {
+        altEl.innerHTML = makeDualLine(alts, fns, scores, rej, 'Score & Altitude', 'Altitude (°)', '#5b9bd5', false);
+        if (tableId) addClickListeners(prefix + 'chart-alt', tableId);
+      } else {
+        altEl.innerHTML = '<p class="no-data">No altitude data available</p>';
+      }
+    }
+  };
+})();
+"""
+
+
+# _THRESHOLD_JS: interactive rejection threshold sliders (plain string, not f-string)
+_THRESHOLD_JS = """
+(function() {
+  // Per-table threshold panel: re-color rows AND update charts based on slider values.
+  // Data attributes on each <tr>: data-filename, data-fwhm, data-ecc, data-score, data-orig-rejected
+  // DATA and prefix are optional — when provided, charts are re-rendered on each slider change.
+  window.initThresholdPanel = function(tableId, panelId, DATA, prefix) {
+    var table = document.getElementById(tableId);
+    var panel = document.getElementById(panelId);
+    if (!table || !panel) return;
+
+    var rows = Array.from(table.querySelectorAll('tbody tr'));
+
+    function getVal(id) { var el = document.getElementById(id); return el ? parseFloat(el.value) : NaN; }
+    function setLabel(id, v, fmt) { var el = document.getElementById(id + '-val'); if (el) el.textContent = fmt ? fmt(v) : v; }
+
+    function applyThresholds() {
+      var sigmaFwhm = getVal(panelId + '-sigma-fwhm');
+      var eccT      = getVal(panelId + '-ecc');
+      var scoreT    = getVal(panelId + '-score');
+
+      setLabel(panelId + '-sigma-fwhm', sigmaFwhm, function(v) { return v.toFixed(1) + '\u03c3'; });
+      setLabel(panelId + '-ecc',        eccT,       function(v) { return v.toFixed(2); });
+      setLabel(panelId + '-score',      scoreT,     function(v) { return v.toFixed(2); });
+
+      // Compute session-level FWHM median and std from data attributes
+      var fwhms = rows.map(function(r) { return parseFloat(r.dataset.fwhm); }).filter(function(v) { return isFinite(v); });
+      var fwhmMed = 0, fwhmStd = 0;
+      if (fwhms.length) {
+        var s = fwhms.slice().sort(function(a,b){return a-b;});
+        fwhmMed = s.length%2 ? s[Math.floor(s.length/2)] : (s[Math.floor(s.length/2)-1]+s[Math.floor(s.length/2)])/2;
+        var mean = fwhms.reduce(function(a,b){return a+b;},0)/fwhms.length;
+        fwhmStd = Math.sqrt(fwhms.reduce(function(a,v){return a+(v-mean)*(v-mean);},0)/fwhms.length);
+      }
+      var fwhmThresh = fwhmMed + sigmaFwhm * fwhmStd;
+
+      var nVis = 0, nRej = 0;
+      // Build filename→rejected map for chart override
+      var rejMap = {};
+      rows.forEach(function(row) {
+        var fwhm    = parseFloat(row.dataset.fwhm);
+        var ecc     = parseFloat(row.dataset.ecc);
+        var score   = parseFloat(row.dataset.score);
+        var origRej = row.dataset.origRejected === '1';
+        var fn      = row.dataset.filename || '';
+
+        var rejected = origRej ||
+          (isFinite(fwhm)  && fwhm  > fwhmThresh) ||
+          (isFinite(ecc)   && ecc   > eccT) ||
+          (isFinite(score) && score < scoreT);
+
+        rejMap[fn] = rejected;
+        row.setAttribute('data-vis-rejected', rejected ? '1' : '0');
+
+        if (rejected) {
+          row.style.backgroundColor = '#fde8e8';
+          nRej++;
+        } else {
+          row.style.backgroundColor = isFinite(score) && score < 0.5 ? '#fff8e1' : '#e8f5e9';
+        }
+        nVis++;
+      });
+
+      var el = document.getElementById(panelId + '-count');
+      if (el) el.textContent = 'Preview: ' + (nVis - nRej) + ' accepted / ' + nRej + ' rejected';
+
+      // Re-render charts with override rejection flags
+      if (DATA && prefix && window.renderCharts) {
+        var overrideRej = DATA.frames.map(function(f) {
+          return rejMap.hasOwnProperty(f.fn) ? rejMap[f.fn] : f.rejected;
+        });
+        window.renderCharts(DATA, prefix, overrideRej);
+      }
+    }
+
+    panel.querySelectorAll('input[type=range]').forEach(function(inp) {
+      inp.addEventListener('input', applyThresholds);
+    });
+  };
+})();
+"""
 
 
 def _plot_quality_trend(
@@ -721,18 +1191,8 @@ def generate_html_report(
         for flag in sorted(all_flags)
     }
 
-    # Generate plots
-    fwhm_plot  = _plot_fwhm_distribution(results)
-    star_plot  = _plot_star_count_distribution(results)
-    score_plot = _plot_score_distribution(results)
-    bg_plot    = _plot_background_distribution(results)
-    trend_plot    = _plot_quality_trend(results)
-    altitude_plot = _plot_score_vs_altitude(results)
-
-    def img_tag(b64: Optional[str], alt: str) -> str:
-        if b64 is None:
-            return f'<p class="no-data">No data for {alt}</p>'
-        return f'<img src="data:image/png;base64,{b64}" alt="{alt}" style="max-width:100%;">'
+    # Chart data JSON (replaces matplotlib PNGs)
+    chart_data_json = _build_chart_data_json(results, "single-", "frames-table")
 
     # Source directory for the move script (embedded as a JS string literal)
     if source_dir is not None:
@@ -745,6 +1205,15 @@ def generate_html_report(
     source_dir_js = json.dumps(_src)
 
     scoring_info = _scoring_info_html(results, weights)
+
+    # FWHM heatmap global range for consistent coloring
+    fwhm_map_min, fwhm_map_max = _compute_fwhm_map_global_range(results)
+
+    # Default threshold values for the interactive slider panel
+    cfg = config or EvalConfig()
+    default_sigma_fwhm = cfg.sigma_fwhm
+    default_ecc = cfg.ecc_threshold
+    default_score = cfg.min_score if cfg.min_score > 0 else 0.5
 
     # --- Build HTML ---
     sorted_results = sorted(results, key=lambda r: r.metrics.filename)
@@ -785,10 +1254,34 @@ def generate_html_report(
         else:
             trail_cell = '<td data-value="0">—</td>'
 
+        # FWHM spatial heatmap cell
+        heatmap_svg = _fwhm_heatmap_svg(m.fwhm_map, fwhm_map_min, fwhm_map_max)
+        heatmap_cell = f'<td style="text-align:center;" title="Spatial FWHM map (5×5 grid)">{heatmap_svg}</td>'
+
+        # Elongation direction/consistency cell
+        ecc_cons = m.elongation_consistency
+        if math.isfinite(ecc_cons):
+            ecc_dir_deg = math.degrees(m.elongation_direction) % 180.0 if math.isfinite(m.elongation_direction) else float("nan")
+            dir_str = f"{ecc_dir_deg:.0f}°" if math.isfinite(ecc_dir_deg) else "?"
+            ecc_color = "#d9534f" if ecc_cons > 0.5 else ("#f0ad4e" if ecc_cons > 0.3 else "#5cb85c")
+            ecc_cell = (
+                f'<td data-value="{ecc_cons:.2f}" title="R={ecc_cons:.2f} (0=random, 1=all aligned). '
+                f'Direction: {dir_str}" style="color:{ecc_color}">'
+                f'R={ecc_cons:.2f}<br><small>{dir_str}</small></td>'
+            )
+        else:
+            ecc_cell = '<td data-value="">—</td>'
+
         is_rejected_int = 1 if r.rejected else 0
         checked_attr = "checked" if r.rejected else ""
+        fwhm_data = f'{m.fwhm_median:.4f}' if math.isfinite(m.fwhm_median) else ""
+        ecc_data = f'{m.eccentricity_median:.4f}' if math.isfinite(m.eccentricity_median) else ""
+        score_data = f'{result.score:.4f}' if math.isfinite(result.score) else ""
         row = (
-            f'<tr style="background-color:{bg};">'
+            f'<tr style="background-color:{bg};" '
+            f'data-filename="{m.filename}" '
+            f'data-fwhm="{fwhm_data}" data-ecc="{ecc_data}" '
+            f'data-score="{score_data}" data-orig-rejected="{is_rejected_int}">'
             f'<td style="text-align:center;">'
             f'<input type="checkbox" class="frame-select" '
             f'data-filename="{m.filename}" data-rejected="{is_rejected_int}" {checked_attr}>'
@@ -802,7 +1295,9 @@ def generate_html_report(
             f"{_format_cell(m.exptime)}"
             f"{_format_cell(m.n_stars)}"
             f"{_format_cell(m.fwhm_median)}"
+            f"{heatmap_cell}"
             f"{_format_cell(m.eccentricity_median)}"
+            f"{ecc_cell}"
             f"{_format_cell(m.snr_weight, precision=1)}"
             f"{_format_cell(m.psf_signal_weight, precision=1)}"
             f"{_format_cell(m.wfwhm)}"
@@ -962,6 +1457,11 @@ def generate_html_report(
       font-size: 0.85em; color: #27ae60; margin-bottom: 8px;
       min-height: 1.2em;
     }}
+    .threshold-panel {{
+      background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px;
+      padding: 8px 14px; margin-bottom: 12px;
+    }}
+    .threshold-panel summary {{ font-size: 0.9em; padding: 2px 0; }}
   </style>
 </head>
 <body>
@@ -999,16 +1499,16 @@ def generate_html_report(
   </section>
 
   <section>
-    <h2>Distribution Plots</h2>
+    <h2>Distribution Charts</h2>
     <div class="plots-grid">
-      <div class="plot-box"><h3>FWHM</h3>{img_tag(fwhm_plot, "FWHM Distribution")}</div>
-      <div class="plot-box"><h3>Star Count</h3>{img_tag(star_plot, "Star Count Distribution")}</div>
-      <div class="plot-box"><h3>Quality Score</h3>{img_tag(score_plot, "Score Distribution")}</div>
-      <div class="plot-box"><h3>Background Noise</h3>{img_tag(bg_plot, "Background Noise Distribution")}</div>
+      <div class="plot-box" id="single-chart-fwhm"><p class="no-data">Loading chart…</p></div>
+      <div class="plot-box" id="single-chart-stars"><p class="no-data">Loading chart…</p></div>
+      <div class="plot-box" id="single-chart-score"><p class="no-data">Loading chart…</p></div>
+      <div class="plot-box" id="single-chart-bg"><p class="no-data">Loading chart…</p></div>
     </div>
     <div style="display:flex;gap:20px;margin-top:20px;flex-wrap:wrap;">
-      <div class="plot-box" style="flex:1;min-width:0;"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="max-width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
-      <div class="plot-box" style="flex:1;min-width:0;"><h3>Quality vs Altitude</h3>{img_tag(altitude_plot, "Quality vs Altitude")}</div>
+      <div class="plot-box" style="flex:1;min-width:0;" id="single-chart-trend"><p class="no-data">Loading chart…</p></div>
+      <div class="plot-box" style="flex:1;min-width:0;" id="single-chart-alt"><p class="no-data">Loading chart…</p></div>
     </div>
   </section>
 
@@ -1019,6 +1519,31 @@ def generate_html_report(
       <span style="background:#fff8e1;padding:2px 8px;border-radius:3px;">Yellow</span> = borderline &nbsp;
       <span style="background:#fde8e8;padding:2px 8px;border-radius:3px;">Red</span> = rejected
     </p>
+
+    <details class="threshold-panel" id="single-thresholds">
+      <summary style="cursor:pointer;font-weight:bold;margin-bottom:10px;">
+        &#9881; Interactive Threshold Preview
+        <span id="single-thresholds-count" class="sel-count" style="font-weight:normal;margin-left:10px;"></span>
+      </summary>
+      <div style="background:white;border-radius:6px;padding:12px 16px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,0.08);display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;">
+        <div>
+          <label style="font-size:0.85em;color:#555;">FWHM sigma: <strong id="single-thresholds-sigma-fwhm-val">{default_sigma_fwhm:.1f}σ</strong></label><br>
+          <input type="range" id="single-thresholds-sigma-fwhm" min="0.5" max="5.0" step="0.1" value="{default_sigma_fwhm:.1f}" style="width:180px;">
+        </div>
+        <div>
+          <label style="font-size:0.85em;color:#555;">Eccentricity max: <strong id="single-thresholds-ecc-val">{default_ecc:.2f}</strong></label><br>
+          <input type="range" id="single-thresholds-ecc" min="0.1" max="0.9" step="0.05" value="{default_ecc:.2f}" style="width:180px;">
+        </div>
+        <div>
+          <label style="font-size:0.85em;color:#555;">Min score: <strong id="single-thresholds-score-val">{default_score:.2f}</strong></label><br>
+          <input type="range" id="single-thresholds-score" min="0.0" max="0.9" step="0.05" value="{default_score:.2f}" style="width:180px;">
+        </div>
+        <div style="font-size:0.8em;color:#888;align-self:center;">
+          Changes here are visual only — they do not affect the CSV report.
+        </div>
+      </div>
+    </details>
+
     <div class="frame-controls">
       <div class="frame-controls-left">
         <button onclick="selectRejected()">&#9746; Select rejected</button>
@@ -1046,7 +1571,9 @@ def generate_html_report(
           <th class="sortable">Exp (s)</th>
           <th class="sortable">Stars</th>
           <th class="sortable">FWHM (")</th>
+          <th title="5×5 spatial FWHM map: green=sharp, red=blurry, grey=no data">FWHM Map</th>
           <th class="sortable">Ecc</th>
+          <th class="sortable" title="Elongation direction consistency R ∈ [0,1]. R≈0: random (good), R≈1: all stars elongated same way (tracking/optical issue). Direction = dominant axis.">Elong.</th>
           <th class="sortable">SNR wt</th>
           <th class="sortable" title="PSFSignalWeight: combines amplitude, FWHM penalty (1/FWHM²), and noise">PSFSW</th>
           <th class="sortable" title="wFWHM = FWHM / sqrt(n_stars): lower is better (Siril metric)">wFWHM</th>
@@ -1074,6 +1601,13 @@ def generate_html_report(
 
   <script>
     const SOURCE_DIR = {source_dir_js};
+    const CHART_DATA = {chart_data_json};
+    {_CHART_JS}
+    {_THRESHOLD_JS}
+
+    // Script is at the bottom of <body>; DOM elements already exist — call directly.
+    renderCharts(CHART_DATA, 'single-');
+    initThresholdPanel('frames-table', 'single-thresholds', CHART_DATA, 'single-');
 
     // -----------------------------------------------------------------------
     // Checkbox helpers
@@ -1090,7 +1624,9 @@ def generate_html_report(
 
     function selectRejected() {{
       document.querySelectorAll('.frame-select').forEach(function(cb) {{
-        cb.checked = cb.dataset.rejected === '1';
+        var tr = cb.closest('tr');
+        var vis = tr ? tr.getAttribute('data-vis-rejected') : null;
+        cb.checked = vis !== null ? vis === '1' : cb.dataset.rejected === '1';
       }});
       updateCount();
     }}
@@ -1313,17 +1849,15 @@ def _build_panel_html(
 
     scoring_info = _scoring_info_html(results, weights)
 
-    fwhm_plot  = _plot_fwhm_distribution(results)
-    star_plot  = _plot_star_count_distribution(results)
-    score_plot = _plot_score_distribution(results)
-    bg_plot    = _plot_background_distribution(results)
-    trend_plot    = _plot_quality_trend(results, filter_name=fid)
-    altitude_plot = _plot_score_vs_altitude(results)
+    chart_data_json = _build_chart_data_json(results, fid + "-", f"frames-table-{fid}")
 
-    def img_tag(b64: Optional[str], alt: str) -> str:
-        if b64 is None:
-            return f'<p class="no-data">No data for {alt}</p>'
-        return f'<img src="data:image/png;base64,{b64}" alt="{alt}" style="max-width:100%;">'
+    fwhm_map_min, fwhm_map_max = _compute_fwhm_map_global_range(results)
+
+    cfg = config or EvalConfig()
+    default_sigma_fwhm = cfg.sigma_fwhm
+    default_ecc = cfg.ecc_threshold
+    default_score = cfg.min_score if cfg.min_score > 0 else 0.5
+    threshold_panel_id = f"thresh-{fid}"
 
     mode = results[0].metrics.mode if results else "star"
     stat_rows = []
@@ -1372,8 +1906,30 @@ def _build_panel_html(
         checked    = "checked" if r.rejected else ""
         prev_url   = f"/preview/{_url_encode(fid)}/{_url_encode(m.filename)}"
 
+        heatmap_svg = _fwhm_heatmap_svg(m.fwhm_map, fwhm_map_min, fwhm_map_max)
+        heatmap_cell = f'<td style="text-align:center;" title="Spatial FWHM map (5×5 grid)">{heatmap_svg}</td>'
+
+        ecc_cons = m.elongation_consistency
+        if math.isfinite(ecc_cons):
+            ecc_dir_deg = math.degrees(m.elongation_direction) % 180.0 if math.isfinite(m.elongation_direction) else float("nan")
+            dir_str = f"{ecc_dir_deg:.0f}°" if math.isfinite(ecc_dir_deg) else "?"
+            ecc_color = "#d9534f" if ecc_cons > 0.5 else ("#f0ad4e" if ecc_cons > 0.3 else "#5cb85c")
+            ecc_cell = (
+                f'<td data-value="{ecc_cons:.2f}" title="R={ecc_cons:.2f}. Direction: {dir_str}" '
+                f'style="color:{ecc_color}">R={ecc_cons:.2f}<br><small>{dir_str}</small></td>'
+            )
+        else:
+            ecc_cell = '<td data-value="">—</td>'
+
+        fwhm_data = f'{m.fwhm_median:.4f}' if math.isfinite(m.fwhm_median) else ""
+        ecc_data = f'{m.eccentricity_median:.4f}' if math.isfinite(m.eccentricity_median) else ""
+        score_data = f'{result.score:.4f}' if math.isfinite(result.score) else ""
+
         rows_html.append(
-            f'<tr style="background-color:{bg};">'
+            f'<tr style="background-color:{bg};" '
+            f'data-filename="{m.filename}" '
+            f'data-fwhm="{fwhm_data}" data-ecc="{ecc_data}" '
+            f'data-score="{score_data}" data-orig-rejected="{is_rej}">'
             f'<td style="text-align:center;"><input type="checkbox" class="frame-select" '
             f'data-filename="{m.filename}" data-rejected="{is_rej}" {checked}></td>'
             f'<td data-value="{i+1}">{i+1}</td>'
@@ -1384,7 +1940,9 @@ def _build_panel_html(
             f"{_format_cell(m.exptime)}"
             f"{_format_cell(m.n_stars)}"
             f"{_format_cell(m.fwhm_median)}"
+            f"{heatmap_cell}"
             f"{_format_cell(m.eccentricity_median)}"
+            f"{ecc_cell}"
             f"{_format_cell(m.snr_weight, precision=1)}"
             f"{_format_cell(m.psf_signal_weight, precision=1)}"
             f"{_format_cell(m.wfwhm)}"
@@ -1426,23 +1984,55 @@ def _build_panel_html(
       </table>
     </div>
   </div>
-  <h2>Distribution Plots</h2>
+  <h2>Distribution Charts</h2>
   <div class="plots-grid">
-    <div class="plot-box"><h3>FWHM</h3>{img_tag(fwhm_plot, "FWHM")}</div>
-    <div class="plot-box"><h3>Star Count</h3>{img_tag(star_plot, "Stars")}</div>
-    <div class="plot-box"><h3>Quality Score</h3>{img_tag(score_plot, "Score")}</div>
-    <div class="plot-box"><h3>Background Noise</h3>{img_tag(bg_plot, "BG Noise")}</div>
+    <div class="plot-box" id="{fid}-chart-fwhm"><p class="no-data">Loading chart…</p></div>
+    <div class="plot-box" id="{fid}-chart-stars"><p class="no-data">Loading chart…</p></div>
+    <div class="plot-box" id="{fid}-chart-score"><p class="no-data">Loading chart…</p></div>
+    <div class="plot-box" id="{fid}-chart-bg"><p class="no-data">Loading chart…</p></div>
   </div>
   <div style="display:flex;gap:20px;margin-top:20px;flex-wrap:wrap;">
-    <div class="plot-box" style="flex:1;min-width:0;"><h3>Quality Trend Over Time</h3>{'<img src="data:image/png;base64,' + trend_plot + '" alt="Quality Trend" style="max-width:100%;">' if trend_plot else '<p class="no-data">No data for Quality Trend</p>'}</div>
-    <div class="plot-box" style="flex:1;min-width:0;"><h3>Quality vs Altitude</h3>{img_tag(altitude_plot, "Quality vs Altitude")}</div>
+    <div class="plot-box" style="flex:1;min-width:0;" id="{fid}-chart-trend"><p class="no-data">Loading chart…</p></div>
+    <div class="plot-box" style="flex:1;min-width:0;" id="{fid}-chart-alt"><p class="no-data">Loading chart…</p></div>
   </div>
+  <script>
+    // renderCharts / initThresholdPanel are defined in the main <script> block at the bottom of the page.
+    // Use DOMContentLoaded so this inline script (parsed earlier) defers until those functions exist.
+    document.addEventListener('DOMContentLoaded', function() {{
+      var d = {chart_data_json};
+      renderCharts(d, '{fid}-');
+      initThresholdPanel('frames-table-{fid}', 'thresh-{fid}', d, '{fid}-');
+    }});
+  </script>
   <h2>Per-Frame Results</h2>
   <p>
     <span style="background:#e8f5e9;padding:2px 8px;border-radius:3px;">Green</span> = accepted &nbsp;
     <span style="background:#fff8e1;padding:2px 8px;border-radius:3px;">Yellow</span> = borderline &nbsp;
     <span style="background:#fde8e8;padding:2px 8px;border-radius:3px;">Red</span> = rejected
   </p>
+  <details class="threshold-panel" id="thresh-{fid}">
+    <summary style="cursor:pointer;font-weight:bold;margin-bottom:10px;">
+      &#9881; Interactive Threshold Preview
+      <span id="thresh-{fid}-count" class="sel-count" style="font-weight:normal;margin-left:10px;"></span>
+    </summary>
+    <div style="background:white;border-radius:6px;padding:12px 16px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,0.08);display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;">
+      <div>
+        <label style="font-size:0.85em;color:#555;">FWHM sigma: <strong id="thresh-{fid}-sigma-fwhm-val">{default_sigma_fwhm:.1f}σ</strong></label><br>
+        <input type="range" id="thresh-{fid}-sigma-fwhm" min="0.5" max="5.0" step="0.1" value="{default_sigma_fwhm:.1f}" style="width:180px;">
+      </div>
+      <div>
+        <label style="font-size:0.85em;color:#555;">Eccentricity max: <strong id="thresh-{fid}-ecc-val">{default_ecc:.2f}</strong></label><br>
+        <input type="range" id="thresh-{fid}-ecc" min="0.1" max="0.9" step="0.05" value="{default_ecc:.2f}" style="width:180px;">
+      </div>
+      <div>
+        <label style="font-size:0.85em;color:#555;">Min score: <strong id="thresh-{fid}-score-val">{default_score:.2f}</strong></label><br>
+        <input type="range" id="thresh-{fid}-score" min="0.0" max="0.9" step="0.05" value="{default_score:.2f}" style="width:180px;">
+      </div>
+      <div style="font-size:0.8em;color:#888;align-self:center;">
+        Changes here are visual only — they do not affect the CSV report.
+      </div>
+    </div>
+  </details>
   <div class="frame-controls">
     <div class="frame-controls-left">
       <button onclick="selectRejected('{fid}')">&#9746; Select rejected</button>
@@ -1471,14 +2061,16 @@ def _build_panel_html(
         <th class="sortable">Exp (s)</th>
         <th class="sortable">Stars</th>
         <th class="sortable">FWHM (&quot;)</th>
+        <th title="5×5 spatial FWHM map: green=sharp, red=blurry">FWHM Map</th>
         <th class="sortable">Ecc</th>
+        <th class="sortable" title="Elongation direction consistency R ∈ [0,1]. R≈0: random (good), R≈1: all stars elongated same way.">Elong.</th>
         <th class="sortable">SNR wt</th>
         <th class="sortable" title="PSFSignalWeight: combines amplitude, FWHM penalty (1/FWHM²), and noise">PSFSW</th>
         <th class="sortable" title="wFWHM = FWHM / sqrt(n_stars): lower is better (Siril metric)">wFWHM</th>
         <th class="sortable" title="Moffat beta: atmospheric seeing index (typical 2.5–5)">β</th>
         <th class="sortable">SNR est</th>
         <th class="sortable">BG RMS</th>
-        <th class="sortable" title="Background gradient: (max−min)/median of the 2D sky background map. Values above threshold are rejected.">Gradient</th>
+        <th class="sortable" title="Background gradient: (max−min)/median of the 2D sky background map.">Gradient</th>
         <th class="sortable">Trails</th>
         <th class="sortable" title="Telescope altitude above horizon in degrees">Alt (°)</th>
         <th class="sortable">Score</th>
@@ -1710,6 +2302,11 @@ def generate_multi_filter_html_report(
     .btn-move:hover {{ background: #c0392b !important; }}
     .sel-count {{ font-size: 0.85em; color: #666; }}
     .move-status {{ font-size: 0.85em; color: #27ae60; margin-bottom: 8px; min-height: 1.2em; }}
+    .threshold-panel {{
+      background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px;
+      padding: 8px 14px; margin-bottom: 12px;
+    }}
+    .threshold-panel summary {{ font-size: 0.9em; padding: 2px 0; }}
 {_TAB_CSS}
   </style>
 </head>
@@ -1734,6 +2331,8 @@ def generate_multi_filter_html_report(
   <script>
     const SOURCE_DIRS = {source_dirs_js};
     const SERVER_MODE = (window.location.protocol === 'http:' || window.location.protocol === 'https:');
+    {_CHART_JS}
+    {_THRESHOLD_JS}
 
     // -----------------------------------------------------------------------
     // Tab switching
@@ -1766,7 +2365,9 @@ def generate_multi_filter_html_report(
     }}
     function selectRejected(fid) {{
       document.querySelectorAll('#tab-' + fid + ' .frame-select').forEach(function(cb) {{
-        cb.checked = cb.dataset.rejected === '1';
+        var tr = cb.closest('tr');
+        var vis = tr ? tr.getAttribute('data-vis-rejected') : null;
+        cb.checked = vis !== null ? vis === '1' : cb.dataset.rejected === '1';
       }});
       updateCount(fid);
     }}

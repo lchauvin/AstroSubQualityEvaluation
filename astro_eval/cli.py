@@ -318,6 +318,8 @@ Examples:
                         help="Parallel worker processes. 0 = all CPU cores. Default: 0.")
     parser.add_argument("--html", action="store_true", default=False,
                         help="Generate HTML report in addition to CSV.")
+    parser.add_argument("--subframeselector", action="store_true", default=False,
+                        help="Export a PixInsight SubFrameSelector-compatible CSV (astro_eval_sfs.csv).")
     parser.add_argument("--serve", action="store_true", default=False,
                         help="Serve HTML report on a local HTTP server. Implies --html.")
     parser.add_argument("--port", type=int, default=7420, metavar="PORT",
@@ -718,7 +720,7 @@ def _watch_loop(
     """Poll for new frames, reprocess session stats, regenerate report, notify browser."""
     from .image_loader import find_fits_files
     from .scoring import evaluate_session
-    from .report import generate_html_report, generate_multi_filter_html_report, generate_csv_report
+    from .report import generate_html_report, generate_multi_filter_html_report, generate_csv_report, generate_subframeselector_csv
 
     # Track processed file paths per filter
     processed: Dict[str, set] = {
@@ -1018,7 +1020,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     from .image_loader import find_fits_files
     from .metrics import EvalConfig
     from .scoring import evaluate_session
-    from .report import generate_csv_report, generate_html_report, generate_multi_filter_html_report
+    from .report import generate_csv_report, generate_html_report, generate_multi_filter_html_report, generate_subframeselector_csv
 
     # -----------------------------------------------------------------------
     # Detect multi-filter vs single-filter
@@ -1149,6 +1151,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             fp = output_dir / f"astro_eval_report_{fid_safe}.csv"
             generate_csv_report(results, fp)
             print(f"CSV report: {fp}")
+            if args.subframeselector:
+                sfs_path = output_dir / f"astro_eval_sfs_{fid_safe}.csv"
+                generate_subframeselector_csv(results, sfs_path)
+                print(f"SubFrameSelector CSV: {sfs_path}")
 
         if args.html or args.serve:
             generate_multi_filter_html_report(filter_data, html_path, filter_dirs, weights=weights, config=config)
@@ -1181,6 +1187,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         generate_csv_report(results, csv_path)
         print(f"CSV report: {csv_path}")
+
+        if args.subframeselector:
+            sfs_path = output_dir / "astro_eval_sfs.csv"
+            generate_subframeselector_csv(results, sfs_path)
+            print(f"SubFrameSelector CSV: {sfs_path}")
 
         if args.html or args.serve:
             generate_html_report(results, session_stats, html_path, source_dir=input_dir, weights=weights, config=config)

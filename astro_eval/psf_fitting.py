@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -41,6 +41,7 @@ class StarFitResult:
     fit_method: str         # 'moffat' or 'gaussian'
     success: bool
     beta: Optional[float] = None   # Moffat beta parameter (None for Gaussian fits)
+    theta: float = 0.0             # PSF orientation angle in radians (major-axis position angle)
 
 
 @dataclass
@@ -55,6 +56,13 @@ class PSFResult:
     psf_residual_median: float
     beta_median: float      # Moffat beta median (nan for Gaussian-only sessions)
     individual: List[StarFitResult]
+
+    # Spatial FWHM map: 5×5 grid of median FWHM (pixels) per image region; NaN = no stars in cell
+    fwhm_map: Optional[List[List[float]]] = field(default=None)
+
+    # Elongation direction statistics (circular statistics on theta)
+    theta_mean: float = float("nan")          # mean PSF orientation angle (radians)
+    theta_consistency: float = float("nan")   # mean resultant length R ∈ [0,1]; 1 = all aligned
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +237,7 @@ def _fit_moffat(
         fit_method="moffat",
         success=True,
         beta=float(beta),
+        theta=float(theta),
     )
 
 
@@ -290,6 +299,7 @@ def _fit_gaussian(
         fit_residual=norm_residual,
         fit_method="gaussian",
         success=True,
+        theta=float(theta),
     )
 
 
@@ -356,6 +366,72 @@ def fit_star(
 
 
 # ---------------------------------------------------------------------------
+# Spatial FWHM map and circular theta statistics
+# ---------------------------------------------------------------------------
+
+_FWHM_MAP_GRID = 5   # spatial grid size (NxN cells)
+
+
+def _compute_fwhm_spatial_map(
+    individual: List[StarFitResult],
+    image_shape: Tuple[int, int],
+    grid: int = _FWHM_MAP_GRID,
+) -> List[List[float]]:
+    """
+    Bin fitted stars into a grid×grid spatial grid and compute median FWHM per cell.
+
+    Returns a (grid × grid) list of floats (pixels); NaN where no stars were fitted.
+    Row 0 is the top of the image (low y), column 0 is the left (low x).
+    """
+    h, w = image_shape
+    cell_h = h / grid
+    cell_w = w / grid
+
+    cells: List[List[List[float]]] = [[[] for _ in range(grid)] for _ in range(grid)]
+    for star in individual:
+        if not (np.isfinite(star.fwhm_pix) and np.isfinite(star.x) and np.isfinite(star.y)):
+            continue
+        ci = min(int(star.y / cell_h), grid - 1)
+        cj = min(int(star.x / cell_w), grid - 1)
+        cells[ci][cj].append(star.fwhm_pix)
+
+    result: List[List[float]] = []
+    for row in cells:
+        result.append([
+            float(np.median(cell)) if cell else float("nan")
+            for cell in row
+        ])
+    return result
+
+
+def _compute_theta_stats(individual: List[StarFitResult]) -> Tuple[float, float]:
+    """
+    Compute mean PSF orientation and alignment consistency using circular statistics.
+
+    Uses the double-angle trick (map θ → 2θ) to handle the π-periodicity of PSF
+    orientation (a star elongated at +45° looks identical at −135°).
+
+    Returns
+    -------
+    (theta_mean_rad, theta_consistency)
+        theta_mean_rad    : mean orientation angle in radians
+        theta_consistency : mean resultant length R ∈ [0, 1]
+                           0 = orientations are random, 1 = all stars elongated identically
+    """
+    thetas = [r.theta for r in individual if np.isfinite(r.theta)]
+    if len(thetas) < 3:
+        return float("nan"), float("nan")
+
+    doubled = np.array(thetas) * 2.0
+    sin_mean = float(np.mean(np.sin(doubled)))
+    cos_mean = float(np.mean(np.cos(doubled)))
+
+    R = float(np.sqrt(sin_mean ** 2 + cos_mean ** 2))
+    mean_theta = float(np.arctan2(sin_mean, cos_mean)) / 2.0
+    return mean_theta, R
+
+
+# ---------------------------------------------------------------------------
 # Batch fitting
 # ---------------------------------------------------------------------------
 
@@ -364,6 +440,7 @@ def fit_psf(
     sources: List[StarSource],
     cutout_half: int = DEFAULT_CUTOUT_HALF,
     max_stars: int = 200,
+    image_shape: Optional[Tuple[int, int]] = None,
 ) -> PSFResult:
     """
     Fit PSF profiles to a collection of stars and aggregate results.
@@ -378,11 +455,16 @@ def fit_psf(
         Half-size of per-star extraction boxes.
     max_stars:
         Maximum number of stars to fit (brightest selected).
+    image_shape:
+        (height, width) of the full image; used for spatial FWHM map computation.
+        If None, uses image.shape.
 
     Returns
     -------
-    PSFResult with aggregated statistics.
+    PSFResult with aggregated statistics and optional spatial FWHM map.
     """
+    shape = image_shape if image_shape is not None else image.shape
+
     if not sources:
         return PSFResult(
             n_fitted=0,
@@ -440,6 +522,12 @@ def fit_psf(
     residual_median = float(np.median(residuals)) if len(residuals) > 0 else float("nan")
     beta_median = float(np.median(betas)) if len(betas) > 0 else float("nan")
 
+    # Spatial FWHM map
+    fwhm_map = _compute_fwhm_spatial_map(individual, shape)
+
+    # Elongation direction consistency (circular statistics on theta)
+    theta_mean, theta_consistency = _compute_theta_stats(individual)
+
     return PSFResult(
         n_fitted=len(individual),
         fwhm_median=fwhm_median,
@@ -449,4 +537,7 @@ def fit_psf(
         psf_residual_median=residual_median,
         beta_median=beta_median,
         individual=individual,
+        fwhm_map=fwhm_map,
+        theta_mean=theta_mean,
+        theta_consistency=theta_consistency,
     )

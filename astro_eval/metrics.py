@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -122,6 +122,13 @@ class FrameMetrics:
 
     # Gas / narrowband metrics
     snr_estimate: float = float("nan")
+
+    # Spatial FWHM map: 5×5 grid of median FWHM (arcsec) per image region; NaN = no stars in cell
+    fwhm_map: Optional[List[List[float]]] = field(default=None)
+
+    # Elongation direction (circular statistics on fitted PSF theta)
+    elongation_direction: float = float("nan")    # mean PSF orientation angle (radians)
+    elongation_consistency: float = float("nan")  # R ∈ [0,1]: 0=random, 1=all aligned same direction
 
     # Trail detection
     n_trails: int = 0
@@ -282,7 +289,7 @@ def compute_star_metrics(
     # Step 3: PSF fitting
     psf = None
     try:
-        psf = fit_psf(image, sources)
+        psf = fit_psf(image, sources, image_shape=image.shape)
         if psf.n_fitted > 0:
             scale = pixel_scale
             metrics.fwhm_median = psf.fwhm_median * scale
@@ -291,6 +298,14 @@ def compute_star_metrics(
             metrics.eccentricity_median = psf.eccentricity_median
             metrics.psf_residual_median = psf.psf_residual_median
             metrics.moffat_beta = psf.beta_median
+            # Convert spatial FWHM map from pixels to arcsec
+            if psf.fwhm_map is not None:
+                metrics.fwhm_map = [
+                    [v * scale if math.isfinite(v) else float("nan") for v in row]
+                    for row in psf.fwhm_map
+                ]
+            metrics.elongation_direction = psf.theta_mean
+            metrics.elongation_consistency = psf.theta_consistency
             logger.debug(
                 "%s: PSF FWHM=%.2f\" ecc=%.3f beta=%.2f from %d stars.",
                 fits_data.filename,
@@ -414,7 +429,7 @@ def compute_gas_metrics(
     if metrics.n_stars > 0:
         psf = None
         try:
-            psf = fit_psf(image, sources)
+            psf = fit_psf(image, sources, image_shape=image.shape)
             if psf.n_fitted > 0:
                 scale = pixel_scale
                 metrics.fwhm_median = psf.fwhm_median * scale
@@ -423,6 +438,13 @@ def compute_gas_metrics(
                 metrics.eccentricity_median = psf.eccentricity_median
                 metrics.psf_residual_median = psf.psf_residual_median
                 metrics.moffat_beta = psf.beta_median
+                if psf.fwhm_map is not None:
+                    metrics.fwhm_map = [
+                        [v * scale if math.isfinite(v) else float("nan") for v in row]
+                        for row in psf.fwhm_map
+                    ]
+                metrics.elongation_direction = psf.theta_mean
+                metrics.elongation_consistency = psf.theta_consistency
                 logger.debug(
                     "%s (gas): PSF FWHM=%.2f\" ecc=%.3f beta=%.2f from %d stars.",
                     fits_data.filename,
