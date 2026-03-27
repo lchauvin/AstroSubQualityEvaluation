@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pyinstaller>=6.0"]
+dev = ["pyinstaller>=6.0", "pytest>=8.0"]
 
 [project.scripts]
 astro-eval = "astro_eval.cli:main"

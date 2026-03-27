@@ -44,22 +44,6 @@ _NARROWBAND_FILTERS = {
     "nb": "narrowband",
 }
 
-_BROADBAND_FILTERS = {
-    "r": "R",
-    "red": "R",
-    "g": "G",
-    "green": "G",
-    "b": "B",
-    "blue": "B",
-    "l": "L",
-    "lum": "L",
-    "luminance": "L",
-    "rgb": "RGB",
-    "clear": "Clear",
-    "ha": "Ha",  # also narrowband, but listed for completeness
-}
-
-
 @dataclass
 class FITSData:
     """Container for FITS image data and metadata."""
@@ -304,11 +288,9 @@ def load_fits(
         # Convert to 2D float64
         image_data = _extract_2d(raw_data)
 
-        # Apply BSCALE / BZERO if present (astropy usually handles this, but be safe)
-        bscale = float(header_dict.get("BSCALE", 1.0))
-        bzero = float(header_dict.get("BZERO", 0.0))
-        if bscale != 1.0 or bzero != 0.0:
-            image_data = image_data * bscale + bzero
+        # Astropy already applies FITS scaling keywords (BSCALE/BZERO) when
+        # returning hdu.data in standard mode. Reapplying here can double-scale
+        # data for files that carry these header keys.
 
         # --- Parse metadata ---
         filter_name: Optional[str] = None

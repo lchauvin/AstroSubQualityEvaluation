@@ -220,7 +220,7 @@ def main() -> None:
     if not exe:
         siril.log(
             "[astro-eval] ERROR: astro-eval.exe not found.\n"
-            "  Install it from: https://github.com/your-repo/releases\n"
+            "  Install it from this project's Releases page\n"
             "  Or ensure it is on your system PATH.",
             color=s.LogColor.RED,
         )

@@ -203,8 +203,6 @@ def _process_directory(
     Process a list of FITS file paths.
     Returns (list[FrameMetrics], n_errors).
     """
-    from .image_loader import find_fits_files  # noqa
-
     all_metrics: List = []
     n_errors = 0
     n_total = len(fits_files)
@@ -410,6 +408,23 @@ def _make_handler(
       For multi-filter pass {filter_name: filter_dir, ...}.
     """
     class ReportHandler(BaseHTTPRequestHandler):
+        @staticmethod
+        def _safe_file_path(base_dir: Path, filename: str) -> Optional[Path]:
+            """
+            Resolve filename under base_dir and reject traversal/invalid paths.
+            """
+            if not isinstance(filename, str) or not filename:
+                return None
+            # This API expects plain filenames, not nested paths.
+            if Path(filename).name != filename:
+                return None
+            try:
+                base_resolved = base_dir.resolve()
+                candidate = (base_resolved / filename).resolve()
+                candidate.relative_to(base_resolved)
+            except Exception:
+                return None
+            return candidate
 
         def do_GET(self) -> None:
             path = urllib.parse.unquote(self.path.split("?")[0])
@@ -447,7 +462,10 @@ def _make_handler(
                 if src_dir is None or not filename:
                     self._send(404, "text/plain", b"Not found")
                     return
-                filepath = src_dir / filename
+                filepath = self._safe_file_path(src_dir, filename)
+                if filepath is None or not filepath.is_file():
+                    self._send(404, "text/plain", b"Not found")
+                    return
                 try:
                     body = _render_preview(filepath)
                     self._send(200, "image/png", body)
@@ -483,10 +501,28 @@ def _make_handler(
 
         def do_POST(self) -> None:
             if self.path == "/move":
-                length  = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length))
-                fid      = payload.get("filter", "")
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._send_json({"moved": [], "errors": ["Invalid Content-Length"]}, code=400)
+                    return
+                if length <= 0 or length > 5 * 1024 * 1024:
+                    self._send_json({"moved": [], "errors": ["Invalid request body size"]}, code=400)
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(length))
+                except Exception:
+                    self._send_json({"moved": [], "errors": ["Invalid JSON payload"]}, code=400)
+                    return
+                if not isinstance(payload, dict):
+                    self._send_json({"moved": [], "errors": ["JSON payload must be an object"]}, code=400)
+                    return
+
+                fid = payload.get("filter", "")
                 filenames = payload.get("filenames", [])
+                if not isinstance(filenames, list):
+                    self._send_json({"moved": [], "errors": ["'filenames' must be a list"]}, code=400)
+                    return
 
                 # Resolve source dir: named filter, or single-filter (""), or first available
                 src_dir = (
@@ -499,12 +535,20 @@ def _make_handler(
                     return
 
                 rejected_dir = src_dir / "_REJECTED"
-                rejected_dir.mkdir(exist_ok=True)
+                rejected_dir.mkdir(parents=True, exist_ok=True)
 
                 moved, errors = [], []
                 for fn in filenames:
+                    if not isinstance(fn, str):
+                        errors.append("Invalid filename entry")
+                        continue
+                    src_path = self._safe_file_path(src_dir, fn)
+                    if src_path is None:
+                        errors.append(f"{fn}: invalid filename")
+                        continue
+                    dst_path = rejected_dir / src_path.name
                     try:
-                        shutil.move(str(src_dir / fn), str(rejected_dir / fn))
+                        shutil.move(str(src_path), str(dst_path))
                         moved.append(fn)
                     except Exception as exc:
                         errors.append(f"{fn}: {exc}")
@@ -520,9 +564,9 @@ def _make_handler(
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_json(self, data: dict) -> None:
+        def _send_json(self, data: dict, code: int = 200) -> None:
             body = json.dumps(data).encode()
-            self._send(200, "application/json", body)
+            self._send(code, "application/json", body)
 
         def handle(self) -> None:
             try:
@@ -710,6 +754,8 @@ def _watch_loop(
     broadcaster: _SSEBroadcaster,
     initial_filter_metrics: Dict[str, List],
     is_multi_filter: bool,
+    weights=None,
+    pixel_size_um: Optional[float] = None,
     interval: int = 30,
     remote_host: Optional[str] = None,
     remote_dir: Optional[str] = None,
@@ -861,6 +907,12 @@ def _watch_loop(
                         if metrics:
                             stats, results = evaluate_session(metrics, config, weights)
                             filter_data[fid] = (results, stats)
+                            fid_safe = "".join(c if c.isalnum() else "_" for c in fid)
+                            fp = csv_path.parent / f"astro_eval_report_{fid_safe}.csv"
+                            generate_csv_report(results, fp)
+                            if args.subframeselector:
+                                sfs_path = csv_path.parent / f"astro_eval_sfs_{fid_safe}.csv"
+                                generate_subframeselector_csv(results, sfs_path)
                     generate_multi_filter_html_report(filter_data, html_path, input_dirs, weights=weights, config=config)
                 else:
                     fid = next(iter(filter_metrics))
@@ -870,6 +922,9 @@ def _watch_loop(
                         generate_html_report(results, stats, html_path,
                                              source_dir=input_dirs[fid], weights=weights, config=config)
                         generate_csv_report(results, csv_path)
+                        if args.subframeselector:
+                            sfs_path = csv_path.parent / "astro_eval_sfs.csv"
+                            generate_subframeselector_csv(results, sfs_path)
 
                 broadcaster.broadcast("reload")
                 print("  Report updated. Browser refreshing.")
@@ -1261,6 +1316,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 broadcaster=broadcaster,
                 initial_filter_metrics=filter_metrics,
                 is_multi_filter=is_multi,
+                weights=weights,
+                pixel_size_um=pixel_size_um,
                 interval=30,
                 remote_host=args.remote,
                 remote_dir=args.remote_dir,

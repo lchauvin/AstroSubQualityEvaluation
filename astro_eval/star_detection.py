@@ -216,24 +216,3 @@ def detect_stars(
     return filtered
 
 
-def estimate_fwhm_from_sources(sources: List[StarSource]) -> float:
-    """
-    Quick FWHM estimate from detected sources (no PSF fitting).
-
-    Uses the median of per-source FWHM estimates derived from SEP shape parameters.
-
-    Parameters
-    ----------
-    sources:
-        List of StarSource objects.
-
-    Returns
-    -------
-    Median FWHM in pixels, or nan if no valid sources.
-    """
-    if not sources:
-        return float("nan")
-    fwhms = [s.fwhm_estimate for s in sources if np.isfinite(s.fwhm_estimate) and s.fwhm_estimate > 0]
-    if not fwhms:
-        return float("nan")
-    return float(np.median(fwhms))

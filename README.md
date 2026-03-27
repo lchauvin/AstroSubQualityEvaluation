@@ -186,7 +186,8 @@ sigma_fwhm   = 2.0
 sigma_noise  = 2.5
 sigma_bg     = 3.0
 sigma_residual = 3.0   # PSF residual flag threshold (informational)
-gradient_threshold = 100.0  # sky gradient in noise σ units; 0 = disabled
+sigma_gradient = 2.0        # session-relative gradient rejection: median + sigma × std
+gradient_threshold = 0.0    # optional absolute gradient hard cap; 0 = disabled
 gradient_knee      = 1.2    # scoring knee multiplier (× session median)
 
 [scoring.star]
@@ -231,7 +232,7 @@ astro-eval INPUT_DIR [OPTIONS]
 | `--sigma-noise SIGMA` | `2.5` | Sigma multiplier for noise statistical rejection |
 | `--sigma-bg SIGMA` | `3.0` | Sigma multiplier for background level rejection |
 | `--sigma-residual SIGMA` | `3.0` | Sigma multiplier for PSF residual flag (informational) |
-| `--gradient-threshold SIGMA` | `100` | Background gradient rejection threshold in noise σ units. 0 = disabled |
+| `--gradient-threshold SIGMA` | `0` | Optional absolute background gradient hard cap in noise σ units. 0 = disabled |
 | `--gradient-knee RATIO` | `1.2` | Scoring knee: penalty steepens above `knee × session_median` gradient |
 | `--detection-threshold SIGMA` | `5.0` | Star detection sigma threshold |
 | `--workers N` | `0` | Parallel worker processes. 0 = all CPU cores |
@@ -318,7 +319,7 @@ Self-contained HTML file (no external dependencies) including:
 
 **Star Count** — Used as a transparency proxy even in narrowband — fewer detected stars indicates reduced sky transparency.
 
-**Background Gradient** — Sky spatial non-uniformity expressed in noise σ units: `(max_cell_bg − min_cell_bg) / noise_rms`, where the image is divided into an 8×8 grid of sigma-clipped sky cells. Normalising by the noise floor (rather than sky level) is critical because auto-stretch dramatically amplifies subtle linear gradients — a gradient that looks enormous in a viewer may only be 1–2% of the sky ADU level but still hundreds of σ above noise. Typical values: uniform sky ~5–30 σ, normal LP gradient ~20–80 σ, severe gradient burning part of the frame ~100–1000+ σ. Values above `gradient_threshold` (default 100) are hard-rejected. Applies to both star and gas modes.
+**Background Gradient** — Sky spatial non-uniformity expressed in noise σ units: `(max_cell_bg − min_cell_bg) / noise_rms`, where the image is divided into an 8×8 grid of sigma-clipped sky cells. Normalising by the noise floor (rather than sky level) is critical because auto-stretch dramatically amplifies subtle linear gradients — a gradient that looks enormous in a viewer may only be 1–2% of the sky ADU level but still hundreds of σ above noise. Typical values: uniform sky ~5–30 σ, normal LP gradient ~20–80 σ, severe gradient burning part of the frame ~100–1000+ σ. By default, hard rejection uses a session-relative threshold (`sigma_gradient`); `gradient_threshold` is an optional absolute cap (default disabled). Applies to both star and gas modes.
 
 **PSFSignalWeight, wFWHM, Moffat β, FWHM, Eccentricity** — PSF fitting is also run in gas mode (same algorithm as star mode). These metrics are populated in the CSV/HTML output and `psf_signal_weight` contributes to the Gas Score (weight 0.15). They are informational in the context of narrowband imaging — star shape doesn't affect nebula detail — but help discriminate between otherwise similar frames and catch severe tracking or focus issues.
 
@@ -375,26 +376,28 @@ The console summary prints session-level statistics for each metric. Each row is
 
 ### Star Score
 ```
-Score = 0.25×(1 - norm_FWHM) + 0.20×(1 - norm_Ecc) + 0.20×norm_Stars
-      + 0.25×norm_PSFSignalWeight + 0.10×gradient_score(background_gradient)
+Score = 0.30×(1 - norm_FWHM) + 0.25×(1 - norm_Ecc) + 0.20×norm_Stars
+      + 0.25×norm_PSFSignalWeight + 0.00×norm_SNRWeight
 ```
 `snr_weight` is retained in the output (CSV/HTML) for reference but has a default weight of 0 — PSFSignalWeight supersedes it because it already captures the amplitude/noise ratio with an additional 1/FWHM² correction. It can be re-enabled via `weight_snr` in `astro_eval.toml` if PSF fitting is unreliable in your data.
 
 ### Gas Score
 ```
-Score = 0.25×norm_SNR + 0.20×(1 - norm_Noise) + 0.10×(1 - norm_BG) + 0.15×norm_Stars
-      + 0.15×norm_PSFSignalWeight + 0.15×gradient_score(background_gradient)
+BaseScore = 0.30×norm_SNR + 0.20×(1 - norm_Noise) + 0.15×(1 - norm_BG)
+          + 0.20×norm_Stars + 0.15×norm_PSFSignalWeight
+
+Score = BaseScore × trail_penalty × gradient_multiplier
 ```
 PSF fitting is also run in gas mode to populate `psf_signal_weight`, `wfwhm`, and `moffat_beta`.
 
-### gradient_score non-linear penalty
+### gradient_multiplier non-linear penalty
 
-`gradient_score` is **not** a simple linear normalization. It uses a piecewise function with a knee at **1.2× the session median gradient**:
+`gradient_multiplier` is a multiplicative penalty (not additive) with a knee at **1.2× the session median gradient**:
 
-- `gradient ≤ gradient_knee × median` → score 1.0 → 0.9 (gentle, ≤10% penalty for typical frames)
-- `gradient > gradient_knee × median` → score 0.9 → 0.0 (steep, reaches 0 at ~4× median)
+- `gradient ≤ gradient_knee × median` → multiplier = 1.0
+- `gradient > gradient_knee × median` → multiplier drops exponentially (floored at 0.05)
 
-This means frames with a normal LP gradient are barely penalised, while frames where one side of the sky is dramatically brighter (sunrise, twilight, cloud edge) are pushed toward 0. The gas mode weight (0.15) is higher than star mode (0.10) because a large gradient is more destructive to faint narrowband signal.
+This means frames with a normal LP gradient are barely penalised, while frames where one side of the sky is dramatically brighter (sunrise, twilight, cloud edge) are pushed toward 0. The gradient multiplier is applied in gas mode scoring.
 
 All metrics are normalized to [0, 1] across the session. Score of 1.0 is the best frame in the session. Statistics are computed **independently per filter** in multi-filter mode.
 
@@ -427,7 +430,7 @@ All metrics are normalized to [0, 1] across the session. Score of 1.0 is the bes
 | `airplane_trail` | Airplane/double contrail detected | Yes |
 | `satellite_trail` | Single satellite trail detected | No (informational) |
 
-> **Note:** Gradients and vignetting are intentionally **not** rejection criteria — these are correctable in post-processing with calibration frames.
+> **Note:** Vignetting is intentionally not a rejection criterion (it is calibratable). Severe gradients can be rejected (`high_gradient`) because they can indicate frames partly burned by twilight/cloud edges.
 
 ## Trail Detection
 
