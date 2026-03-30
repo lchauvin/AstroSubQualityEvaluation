@@ -438,7 +438,14 @@ def _text_to_html(text: str) -> str:
 
 
 def inject_analysis_html(html_path: Path, analysis_text: str, model_str: str) -> None:
-    """Inject the AI analysis card before <footer> (or before </body> as fallback)."""
+    """
+    Inject the AI analysis card into the HTML report.
+
+    Multi-filter (tabbed) reports: injects inside the Summary tab so the card
+    is only visible when the Summary tab is active.
+
+    Single-filter reports: injects before <footer>.
+    """
     html_body = _text_to_html(analysis_text)
 
     injection = f"""{_AI_STYLES}
@@ -459,12 +466,27 @@ def inject_analysis_html(html_path: Path, analysis_text: str, model_str: str) ->
 """
     try:
         content = html_path.read_text(encoding="utf-8")
+
+        # Multi-filter tabbed report: find the Summary tab and inject inside it,
+        # right before the first filter tab pane begins.
+        summary_marker = 'id="tab-summary"'
+        filter_pane_marker = '<div class="tab-pane" id="tab-'
+        if summary_marker in content:
+            summary_pos = content.find(summary_marker)
+            insert_pos = content.find(filter_pane_marker, summary_pos + len(summary_marker))
+            if insert_pos != -1:
+                content = content[:insert_pos] + injection + "\n" + content[insert_pos:]
+                html_path.write_text(content, encoding="utf-8")
+                return
+            # Summary tab found but no filter panes — fall through to footer
+
+        # Single-filter report: inject before the page footer
         if "<footer" in content:
             content = content.replace("<footer", injection + "\n<footer", 1)
         elif "</body>" in content:
             content = content.replace("</body>", injection + "\n</body>", 1)
         else:
-            logger.warning("Could not inject analysis: no <footer> or </body> in %s", html_path)
+            logger.warning("Could not inject analysis: no known anchor found in %s", html_path)
             return
         html_path.write_text(content, encoding="utf-8")
     except Exception as exc:
