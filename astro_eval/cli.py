@@ -1282,7 +1282,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     # -----------------------------------------------------------------------
     if args.analysis and filter_data:
         from .analysis import load_dotenv, run_analysis, inject_analysis_html
-        import os
 
         # Search for .env in: session dir, user config dir, cwd
         _env_search = [input_dir, output_dir]
