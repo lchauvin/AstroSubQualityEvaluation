@@ -53,6 +53,22 @@ Example config (all fields optional):
     serve   = false
     port    = 7420
     verbose = false
+
+    [analysis]
+    # LLM-powered session diagnosis — only runs when --analysis is passed.
+    # Model format: "provider/model-id"
+    #   Supported providers: anthropic | openai | ollama
+    model      = "anthropic/claude-haiku-4-5-20251001"
+    # model    = "anthropic/claude-sonnet-4-6"
+    # model    = "openai/gpt-4o-mini"
+    # model    = "ollama/qwen3:14b"
+    ollama_url = "http://localhost:11434"   # only relevant for ollama provider
+    max_tokens = 1500
+
+    # API keys go in a .env file next to astro_eval.toml (or in environment):
+    #   ANTHROPIC_API_KEY=sk-ant-...
+    #   OPENAI_API_KEY=sk-...
+    # Ollama runs locally and needs no key.
 """
 
 from __future__ import annotations

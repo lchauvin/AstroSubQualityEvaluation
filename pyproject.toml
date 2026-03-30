@@ -18,6 +18,14 @@ dependencies = [
     "tomli>=1.2; python_version < '3.11'",
 ]
 
+[project.optional-dependencies]
+# pip install astro-eval[anthropic]   → Anthropic Claude models
+anthropic = ["anthropic>=0.40"]
+# pip install astro-eval[openai]      → OpenAI models (also works for Ollama)
+openai    = ["openai>=1.0"]
+# pip install astro-eval[analysis]    → all LLM providers + .env loading
+analysis  = ["anthropic>=0.40", "openai>=1.0", "python-dotenv>=1.0"]
+
 [dependency-groups]
 dev = ["pyinstaller>=6.0", "pytest>=8.0"]
 

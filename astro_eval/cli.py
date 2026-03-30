@@ -340,6 +340,14 @@ Examples:
     parser.add_argument("--config", metavar="FILE", default=None,
                         help="Path to TOML config file. Default: auto-detect astro_eval.toml "
                              "in INPUT_DIR or current directory.")
+    parser.add_argument("--analysis", action="store_true", default=False,
+                        help=(
+                            "Run LLM-powered session diagnosis after evaluation. "
+                            "Configure model in astro_eval.toml [analysis] section "
+                            "(e.g. model = \"anthropic/claude-haiku-4-5-20251001\"). "
+                            "API keys are read from .env in the session directory "
+                            "or from environment variables."
+                        ))
     parser.add_argument("--version", action="version", version=f"astro-eval {__version__}")
 
     return parser
@@ -1268,6 +1276,71 @@ def main(argv: Optional[List[str]] = None) -> int:
             if ss.count:
                 print(f"  {name:30s}: median={ss.median:.4g}  std={ss.std:.4g}  n={ss.count}")
         print("=" * 60)
+
+    # -----------------------------------------------------------------------
+    # LLM session analysis  (only when --analysis is passed)
+    # -----------------------------------------------------------------------
+    if args.analysis and filter_data:
+        from .analysis import load_dotenv, run_analysis, inject_analysis_html
+        import os
+
+        # Search for .env in: session dir, user config dir, cwd
+        _env_search = [input_dir, output_dir]
+        _appdata = os.environ.get("APPDATA")
+        if _appdata:
+            _env_search.append(Path(_appdata) / "astro-eval")
+        else:
+            _env_search.append(Path.home() / ".config" / "astro_eval")
+        _env_search.append(Path.cwd())
+        load_dotenv(_env_search)
+
+        _model_str   = _cfg.get("analysis.model", "").strip()
+        _ollama_url  = _cfg.get("analysis.ollama_url", None)
+        _max_tokens  = int(_cfg.get("analysis.max_tokens", 1500))
+
+        if not _model_str:
+            print(
+                "\n[analysis] No model configured. Add to astro_eval.toml:\n"
+                "  [analysis]\n"
+                "  model = \"anthropic/claude-haiku-4-5-20251001\"\n"
+                "  # or: model = \"openai/gpt-4o-mini\"\n"
+                "  # or: model = \"ollama/qwen3:14b\"",
+                file=sys.stderr,
+            )
+        else:
+            print(f"\nRunning LLM analysis ({_model_str})...")
+            try:
+                analysis_text = run_analysis(
+                    filter_data, _model_str, config,
+                    ollama_url=_ollama_url,
+                    max_tokens=_max_tokens,
+                )
+
+                # Write plain-text file
+                analysis_path = output_dir / "astro_eval_analysis.txt"
+                analysis_path.write_text(analysis_text, encoding="utf-8")
+                print(f"Analysis saved: {analysis_path}")
+
+                # Print to stdout
+                print()
+                print("=" * 60)
+                print("AI SESSION ANALYSIS")
+                print("=" * 60)
+                print(analysis_text)
+                print("=" * 60)
+
+                # Inject into HTML report if it was generated
+                if (args.html or args.serve) and html_path.exists():
+                    inject_analysis_html(html_path, analysis_text, _model_str)
+                    print(f"Analysis injected into HTML report.")
+
+            except (ValueError, ImportError) as exc:
+                print(f"\n[analysis] {exc}", file=sys.stderr)
+            except Exception as exc:
+                print(f"\n[analysis] Unexpected error: {exc}", file=sys.stderr)
+                if args.verbose:
+                    import traceback
+                    traceback.print_exc()
 
     # -----------------------------------------------------------------------
     # Serve / watch
