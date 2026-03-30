@@ -467,18 +467,17 @@ def inject_analysis_html(html_path: Path, analysis_text: str, model_str: str) ->
     try:
         content = html_path.read_text(encoding="utf-8")
 
-        # Multi-filter tabbed report: find the Summary tab and inject inside it,
-        # right before the first filter tab pane begins.
+        # Multi-filter tabbed report: inject as the first child of the Summary tab
+        # pane so it is hidden/shown together with the tab by the existing JS.
         summary_marker = 'id="tab-summary"'
-        filter_pane_marker = '<div class="tab-pane" id="tab-'
         if summary_marker in content:
             summary_pos = content.find(summary_marker)
-            insert_pos = content.find(filter_pane_marker, summary_pos + len(summary_marker))
-            if insert_pos != -1:
-                content = content[:insert_pos] + injection + "\n" + content[insert_pos:]
+            # Move past the opening tag's closing '>'
+            open_tag_end = content.find(">", summary_pos) + 1
+            if open_tag_end > 0:
+                content = content[:open_tag_end] + "\n" + injection + content[open_tag_end:]
                 html_path.write_text(content, encoding="utf-8")
                 return
-            # Summary tab found but no filter panes — fall through to footer
 
         # Single-filter report: inject before the page footer
         if "<footer" in content:
