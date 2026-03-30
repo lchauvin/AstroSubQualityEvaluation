@@ -59,14 +59,14 @@ Write in plain prose with labelled sections — do NOT use Markdown, bullet
 lists, asterisks, or code blocks.  The output will be embedded in an HTML
 report and a plain-text file, so keep formatting minimal.
 
-Structure your response with exactly these section labels on their own lines:
-  OVERVIEW
-  SEEING
-  TRACKING AND GUIDING
-  TRANSPARENCY
-  ROOT CAUSES
-  RECOMMENDATIONS
-  QUALITY RATING
+Structure your response with exactly these section labels (surrounder by <b></b> tags) on their own lines:
+  \n\nOVERVIEW
+  \n\nSEEING
+  \n\nTRACKING AND GUIDING
+  \n\nTRANSPARENCY
+  \n\nROOT CAUSES
+  \n\nRECOMMENDATIONS
+  \n\nQUALITY RATING
 
 Rules:
 - Be specific: reference the actual metric values in your diagnosis.
@@ -138,8 +138,11 @@ def _build_prompt(filter_data: dict, config) -> str:
     header = [
         "ASTROPHOTOGRAPHY SESSION QUALITY DATA",
         f"Telescope focal length: {config.focal_length_mm:.0f} mm",
-        "",
     ]
+
+    if config.bortle > 0:
+        header.extend(f"Sky Bortle: {config.bortle}")
+    header.extend("")
 
     filter_sections: List[str] = []
 
@@ -234,6 +237,7 @@ TRAILS: {n_airplane} airplane | {n_satellite} satellite/unknown
 Please analyse the session data above.  Diagnose the dominant quality factors,
 explain the specific rejection causes, interpret the elongation consistency
 (systematic vs. random), and give practical advice for the next session.
+Take into consideration in your analysis of the light pollution (Bortle) if precised.
 End with an overall QUALITY RATING."""
 
     return "\n".join(header + filter_sections + [closing])
@@ -297,61 +301,172 @@ def _call_openai_compat(
 # HTML helpers
 # ---------------------------------------------------------------------------
 
+_SECTION_LABELS = {
+    "OVERVIEW", "SEEING", "TRACKING AND GUIDING", "TRANSPARENCY",
+    "ROOT CAUSES", "RECOMMENDATIONS", "QUALITY RATING",
+}
+
+# Sections rendered side-by-side in a 2-column grid
+_TWO_COL_SECTIONS = {"SEEING", "TRACKING AND GUIDING"}
+
+_RATING_COLORS = {
+    "excellent": "#27ae60",
+    "good":      "#2ecc71",
+    "fair":      "#f39c12",
+    "poor":      "#e74c3c",
+    "unusable":  "#922b21",
+}
+
+_AI_STYLES = """\
+<style>
+.ae-ai-card{background:#fff;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,.08);
+  padding:1.5rem 2rem;margin:1.5rem 0;border-top:4px solid #3498db}
+.ae-ai-header{display:flex;align-items:center;gap:.75rem;margin-bottom:1.25rem}
+.ae-ai-header h2{margin:0;color:#2c3e50;font-size:1.4rem}
+.ae-ai-model{font-family:monospace;font-size:.75rem;background:#eaf2fb;
+  color:#2980b9;padding:.2rem .55rem;border-radius:4px;white-space:nowrap}
+.ae-ai-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin:.75rem 0}
+.ae-ai-section h3{font-size:.85rem;font-weight:700;letter-spacing:.06em;
+  text-transform:uppercase;color:#2c3e50;margin:1rem 0 .3rem;border-bottom:1px solid #ecf0f1;
+  padding-bottom:.25rem}
+.ae-ai-section p{margin:.35rem 0;color:#333;line-height:1.7;font-size:.92rem}
+.ae-ai-rating{display:inline-block;padding:.35rem 1rem;border-radius:20px;
+  color:#fff;font-weight:700;font-size:.9rem;margin-top:.4rem}
+.ae-ai-footer{color:#7f8c8d;font-size:.75rem;margin-top:1.25rem;
+  padding-top:.75rem;border-top:1px solid #ecf0f1}
+</style>"""
+
+
+def _strip_html_tags(text: str) -> str:
+    """Remove HTML tags for label detection."""
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
 def _text_to_html(text: str) -> str:
     """
-    Convert the LLM's plain-text output to simple HTML.
+    Convert LLM plain-text output to structured HTML cards.
 
-    Handles the labelled section headings the system prompt asks for
-    (e.g. "OVERVIEW", "SEEING") and wraps other paragraphs in <p> tags.
+    Handles section labels in plain or <b>LABEL</b> format.
+    Pairs SEEING + TRACKING AND GUIDING into a 2-column grid.
+    Adds a coloured badge for the QUALITY RATING section.
     """
-    _SECTION_LABELS = {
-        "OVERVIEW", "SEEING", "TRACKING AND GUIDING", "TRANSPARENCY",
-        "ROOT CAUSES", "RECOMMENDATIONS", "QUALITY RATING",
-    }
-
+    # Split on blank lines
     paragraphs = re.split(r"\n{2,}", text.strip())
-    html_parts: List[str] = []
+
+    # Build list of (label_or_None, content_lines)
+    sections: List[tuple] = []  # (label: str|None, html: str)
+    current_label: Optional[str] = None
+    current_parts: List[str] = []
+
+    def _flush():
+        nonlocal current_label, current_parts
+        if current_parts or current_label is not None:
+            sections.append((current_label, "\n".join(current_parts)))
+        current_label = None
+        current_parts = []
 
     for para in paragraphs:
         para = para.strip()
         if not para:
             continue
-        # Check if the whole paragraph is a section label
-        if para.upper() in _SECTION_LABELS:
-            html_parts.append(
-                f'<h3 style="color:#a0c4f7;margin:1.2rem 0 0.4rem">{para.title()}</h3>'
-            )
+        clean = _strip_html_tags(para).upper()
+        if clean in _SECTION_LABELS:
+            _flush()
+            current_label = clean
         else:
-            # Inline line-breaks within a paragraph
             para_html = para.replace("\n", "<br>\n")
-            html_parts.append(f'<p style="margin:0.4rem 0">{para_html}</p>')
+            current_parts.append(f'<p>{para_html}</p>')
+
+    _flush()
+
+    # Render sections
+    html_parts: List[str] = []
+    i = 0
+    while i < len(sections):
+        label, body = sections[i]
+
+        if label is None:
+            # Preamble text before any section label
+            html_parts.append(f'<div class="ae-ai-section">{body}</div>')
+            i += 1
+            continue
+
+        if label == "QUALITY RATING":
+            # Extract rating word for badge colour
+            rating_word = ""
+            for word in ["excellent", "good", "fair", "poor", "unusable"]:
+                if word in body.lower():
+                    rating_word = word
+                    break
+            color = _RATING_COLORS.get(rating_word, "#7f8c8d")
+            badge = (
+                f'<span class="ae-ai-rating" style="background:{color}">'
+                f'{rating_word.title()}</span>' if rating_word else ""
+            )
+            html_parts.append(
+                f'<div class="ae-ai-section">'
+                f'<h3>Quality Rating</h3>{body}{badge}</div>'
+            )
+            i += 1
+            continue
+
+        if label in _TWO_COL_SECTIONS:
+            # Try to pair with the other 2-col section if it follows immediately
+            next_label = sections[i + 1][0] if i + 1 < len(sections) else None
+            if next_label in _TWO_COL_SECTIONS and next_label != label:
+                _, body2 = sections[i + 1]
+                col1 = (
+                    f'<div class="ae-ai-section">'
+                    f'<h3>{label.title()}</h3>{body}</div>'
+                )
+                col2 = (
+                    f'<div class="ae-ai-section">'
+                    f'<h3>{next_label.title()}</h3>{body2}</div>'
+                )
+                html_parts.append(f'<div class="ae-ai-grid">{col1}{col2}</div>')
+                i += 2
+                continue
+
+        # Normal full-width section
+        html_parts.append(
+            f'<div class="ae-ai-section">'
+            f'<h3>{label.title()}</h3>{body}</div>'
+        )
+        i += 1
 
     return "\n".join(html_parts)
 
 
 def inject_analysis_html(html_path: Path, analysis_text: str, model_str: str) -> None:
-    """Inject the AI analysis as a styled section before </body>."""
+    """Inject the AI analysis card before <footer> (or before </body> as fallback)."""
     html_body = _text_to_html(analysis_text)
-    injection = f"""
-<section style="max-width:960px;margin:2rem auto;padding:1.5rem 2rem;
-                background:#111d35;border-radius:8px;
-                border-left:4px solid #7eb8f7;font-family:inherit">
-  <h2 style="color:#7eb8f7;margin-top:0">AI Session Analysis</h2>
-  <div style="color:#d0dff5;line-height:1.75;font-size:0.95rem">
-    {html_body}
+
+    injection = f"""{_AI_STYLES}
+<div class="ae-ai-card">
+  <div class="ae-ai-header">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none"
+         xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" stroke="#3498db" stroke-width="2"/>
+      <path d="M8 12h8M12 8v8" stroke="#3498db" stroke-width="2"
+            stroke-linecap="round"/>
+    </svg>
+    <h2>AI Session Analysis</h2>
+    <span class="ae-ai-model">{model_str}</span>
   </div>
-  <p style="color:#5a6a8a;font-size:0.78rem;margin-bottom:0;margin-top:1rem">
-    Generated by {model_str} &mdash; astro-eval --analysis
-  </p>
-</section>
+  {html_body}
+  <div class="ae-ai-footer">Generated by astro-eval --analysis</div>
+</div>
 """
     try:
         content = html_path.read_text(encoding="utf-8")
-        if "</body>" in content:
+        if "<footer" in content:
+            content = content.replace("<footer", injection + "\n<footer", 1)
+        elif "</body>" in content:
             content = content.replace("</body>", injection + "\n</body>", 1)
-            html_path.write_text(content, encoding="utf-8")
         else:
-            logger.warning("Could not inject analysis: </body> not found in %s", html_path)
+            logger.warning("Could not inject analysis: no <footer> or </body> in %s", html_path)
+            return
+        html_path.write_text(content, encoding="utf-8")
     except Exception as exc:
         logger.warning("HTML injection failed: %s", exc)
 
