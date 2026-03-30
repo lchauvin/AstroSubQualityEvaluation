@@ -48,24 +48,30 @@ def _compute_background_gradient(image: np.ndarray, n_cells: int = 8) -> float:
     computing the sigma-clipped sky median of each cell, then expressing the
     peak-to-valley variation in units of the per-pixel noise (σ).
 
-    Returns (max_cell_bg - min_cell_bg) / noise_rms.
+    Returns (p90 - p10 of cell background medians) / noise_rms.
 
-    Normalising by noise rather than by the sky median makes the metric
+    Using the inter-percentile range (p90 − p10) instead of max − min makes
+    the metric robust against a single anomalous cell (hot-pixel cluster,
+    diffraction spike, cloud edge) that would otherwise inflate the gradient
+    estimate and trigger false rejections.  With n_cells=8 (64 cells total),
+    the central 80 % of cells still provide a faithful measurement of the
+    true sky gradient while the two most extreme cells are ignored.
+
+    Normalising by noise_rms (rather than by the sky median) makes the metric
     camera- and gain-independent: it directly answers "how many noise standard
-    deviations does the gradient span?"  This is critical because a gradient
-    that looks dramatic after stretching (where the sky level dominates the
-    denominator) may only be ~1 % of the sky ADU level but still hundreds of σ
-    above noise — and therefore genuinely damaging to the data.
+    deviations does the sky vary across the frame?"  A gradient that looks
+    dramatic after stretching may only be ~1 % of the sky ADU level but still
+    hundreds of σ above noise — and therefore genuinely damaging to the data.
 
     This approach avoids SEP's background model, which sigma-clips bright
     regions and can produce a spuriously flat map even when part of the image
     is burned by sunrise or a cloud edge.
 
-    Typical values
+    Typical values (p90−p10 metric; roughly 80% of former max−min values)
     --------------
-    Uniform sky / good night:        ~5–30 σ
-    Normal LP gradient (Bortle 9):   ~20–80 σ
-    Severe gradient (sunrise/cloud): ~100–1000+ σ
+    Uniform sky / good night:        ~5–25 σ
+    Normal LP gradient (Bortle 9):   ~15–65 σ
+    Severe gradient (sunrise/cloud): ~80–800+ σ
     """
     h, w = image.shape
     cell_h = max(h // n_cells, 1)
@@ -105,7 +111,22 @@ def _compute_background_gradient(image: np.ndarray, n_cells: int = 8) -> float:
     if noise_rms <= 0:
         return float("nan")
 
-    return float((max(cell_medians) - min(cell_medians)) / noise_rms)
+    arr = np.array(cell_medians)
+    if len(arr) >= 10:
+        # Use the p90–p10 inter-percentile range instead of max–min so that a
+        # single anomalous cell (hot-pixel cluster, diffraction spike, cosmic
+        # ray edge) cannot inflate the metric.  With n_cells=8 (64 cells total)
+        # this covers the central 80% of cells and still captures the true
+        # sky gradient.  The result is ~80% of max–min for a linear gradient,
+        # but the metric is session-relative everywhere it drives decisions
+        # (sigma_gradient criterion, gradient_knee penalty), so the scale
+        # shift is self-normalising within a session.
+        span = float(np.percentile(arr, 90) - np.percentile(arr, 10))
+    else:
+        # Fall back to max–min for very small grids.
+        span = float(np.max(arr) - np.min(arr))
+
+    return float(span / noise_rms)
 
 
 def estimate_background_sigma_clip(

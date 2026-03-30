@@ -32,6 +32,11 @@ class SessionStats:
     std: float
     min_val: float
     max_val: float
+    # Robust normalization bounds: available when count ≥ 10 (else equal to min/max).
+    # Using p5/p95 prevents a single outlier frame from compressing all other scores
+    # into a narrow band at one end of the [0, 1] normalization range.
+    p5: float = float("nan")
+    p95: float = float("nan")
 
     def __repr__(self) -> str:
         return (
@@ -85,14 +90,26 @@ def _session_stats(
             median=float("nan"), mean=float("nan"), std=float("nan"),
             min_val=float("nan"), max_val=float("nan"),
         )
+    # Robust normalization bounds: use p5/p95 when n ≥ 10 so that one extreme
+    # outlier frame cannot compress all other frames' scores into a narrow band.
+    # For smaller sessions, p5/p95 are virtually identical to min/max anyway.
+    min_val = float(np.min(vals))
+    max_val = float(np.max(vals))
+    if n >= 10:
+        p5  = float(np.percentile(vals, 5))
+        p95 = float(np.percentile(vals, 95))
+    else:
+        p5, p95 = min_val, max_val
     return SessionStats(
         metric_name=attr,
         count=n,
         median=float(np.median(vals)),
         mean=float(np.mean(vals)),
         std=float(np.std(vals, ddof=1)) if n > 1 else 0.0,
-        min_val=float(np.min(vals)),
-        max_val=float(np.max(vals)),
+        min_val=min_val,
+        max_val=max_val,
+        p5=p5,
+        p95=p95,
     )
 
 
@@ -341,9 +358,12 @@ def _normalize(value: float, min_val: float, max_val: float) -> float:
     """
     Normalize a value to [0, 1] within the given range.
 
-    Returns 0.5 if range is zero or value is not finite.
+    Returns 0.5 if the range is zero, or if any argument is non-finite.
+    All three arguments are checked explicitly: passing NaN min/max would
+    cause span=NaN, then NaN<=0 evaluates to False in Python, then the clip
+    expression returns NaN rather than the safe fallback 0.5.
     """
-    if not math.isfinite(value):
+    if not (math.isfinite(value) and math.isfinite(min_val) and math.isfinite(max_val)):
         return 0.5
     span = max_val - min_val
     if span <= 0:
@@ -379,11 +399,13 @@ def compute_star_score(
             float("nan"), float("nan"),
         ))
 
-    norm_fwhm  = _normalize(metrics.fwhm_median,        s("fwhm_median").min_val,        s("fwhm_median").max_val)
-    norm_ecc   = _normalize(metrics.eccentricity_median, s("eccentricity_median").min_val, s("eccentricity_median").max_val)
-    norm_stars = _normalize(float(metrics.n_stars),      s("n_stars").min_val,             s("n_stars").max_val)
-    norm_snr   = _normalize(metrics.snr_weight,          s("snr_weight").min_val,          s("snr_weight").max_val)
-    norm_psfsw = _normalize(metrics.psf_signal_weight,   s("psf_signal_weight").min_val,   s("psf_signal_weight").max_val)
+    # Use p5/p95 for normalization bounds so a single extreme-outlier frame cannot
+    # compress all other frames' scores toward one end of [0, 1].
+    norm_fwhm  = _normalize(metrics.fwhm_median,        s("fwhm_median").p5,        s("fwhm_median").p95)
+    norm_ecc   = _normalize(metrics.eccentricity_median, s("eccentricity_median").p5, s("eccentricity_median").p95)
+    norm_stars = _normalize(float(metrics.n_stars),      s("n_stars").p5,             s("n_stars").p95)
+    norm_snr   = _normalize(metrics.snr_weight,          s("snr_weight").p5,          s("snr_weight").p95)
+    norm_psfsw = _normalize(metrics.psf_signal_weight,   s("psf_signal_weight").p5,   s("psf_signal_weight").p95)
 
     score = (
         w.star_fwhm  * (1.0 - norm_fwhm)
@@ -414,11 +436,12 @@ def compute_gas_score(
             float("nan"), float("nan"),
         ))
 
-    norm_snr   = _normalize(metrics.snr_estimate,    s("snr_estimate").min_val,    s("snr_estimate").max_val)
-    norm_noise = _normalize(metrics.background_rms,  s("background_rms").min_val,  s("background_rms").max_val)
-    norm_bg    = _normalize(metrics.background_median, s("background_median").min_val, s("background_median").max_val)
-    norm_stars = _normalize(float(metrics.n_stars),  s("n_stars").min_val,         s("n_stars").max_val)
-    norm_psfsw = _normalize(metrics.psf_signal_weight, s("psf_signal_weight").min_val, s("psf_signal_weight").max_val)
+    # Use p5/p95 for normalization bounds (see compute_star_score for rationale).
+    norm_snr   = _normalize(metrics.snr_estimate,      s("snr_estimate").p5,      s("snr_estimate").p95)
+    norm_noise = _normalize(metrics.background_rms,    s("background_rms").p5,    s("background_rms").p95)
+    norm_bg    = _normalize(metrics.background_median,  s("background_median").p5,  s("background_median").p95)
+    norm_stars = _normalize(float(metrics.n_stars),    s("n_stars").p5,            s("n_stars").p95)
+    norm_psfsw = _normalize(metrics.psf_signal_weight, s("psf_signal_weight").p5,  s("psf_signal_weight").p95)
 
     score = (
         w.gas_snr   * norm_snr

@@ -171,27 +171,34 @@ def _compute_snr_weight(
 
 def _compute_psf_signal_weight(psf, noise_rms: float) -> float:
     """
-    PixInsight-inspired PSFSignalWeight.
+    PixInsight-compatible PSFSignalWeight (PSFSW).
 
-    Combines fitted peak amplitudes with noise and FWHM, penalizing larger
-    FWHM super-linearly (~1/FWHM²).  Unlike snr_weight (which uses aperture
-    flux), this metric directly rewards frames where stars are sharp.
+    Formula (averaged over n fitted stars):
+        PSFSW = Σ_i (A_i² / FWHM_i²) / (2 × noise² × n)
 
-    Formula: (Σ A_i)² / (2 × noise² × n × FWHM_px_median²)
+    This matches the PixInsight SubframeSelector definition:
+    - Sums squared amplitudes A_i², not the square of their sum (Σ A_i)²;
+      (Σ A_i)² ≠ Σ(A_i²) and would grow quadratically with star count.
+    - Uses each star's individual FWHM_i (pixels), not the session median,
+      so the metric is sensitive to per-star sharpness variation across the field.
+    - Divides by n so the result is a per-star average, independent of how
+      many stars happen to be detected in a given frame.
+
+    Qualitatively: higher PSFSW means brighter, sharper stars relative to
+    the background noise floor.  FWHM² in the denominator penalises poor
+    seeing super-linearly (2× worse FWHM → 4× lower PSFSW).
     """
     individual = [
         r for r in psf.individual
         if r.success and math.isfinite(r.amplitude) and math.isfinite(r.fwhm_pix)
-        and r.amplitude > 0
+        and r.amplitude > 0 and r.fwhm_pix > 0
     ]
     if not individual or noise_rms <= 0:
         return float("nan")
-    if not math.isfinite(psf.fwhm_median) or psf.fwhm_median <= 0:
-        return float("nan")
-    amp_sum = sum(r.amplitude for r in individual)
+
+    signal_sum = sum(r.amplitude ** 2 / r.fwhm_pix ** 2 for r in individual)
     n = len(individual)
-    fwhm_px = psf.fwhm_median
-    return float((amp_sum ** 2) / (2.0 * noise_rms ** 2 * n * fwhm_px ** 2))
+    return float(signal_sum / (2.0 * noise_rms ** 2 * n))
 
 
 def _estimate_gas_snr(

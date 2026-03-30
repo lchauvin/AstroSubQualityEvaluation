@@ -56,10 +56,11 @@ def _sep_to_sources(objects, image_shape: tuple) -> List[StarSource]:
     """Convert SEP extraction result array to list of StarSource objects."""
     sources = []
     for obj in objects:
-        # FWHM estimate from semi-major axis assuming Gaussian profile
-        # FWHM ≈ 2 * sqrt(2 * ln(2)) * sigma ≈ 2.355 * sigma
-        # For SEP, a is approximately sigma of the Gaussian
-        fwhm_est = 2.0 * np.sqrt(2.0 * np.log(2.0)) * float(obj["a"]) * 2.0
+        # FWHM from SEP's 'a' parameter.
+        # SEP 'a' is the RMS of the light distribution along the major axis,
+        # which equals Gaussian sigma for a circular Gaussian.
+        # FWHM = 2 * sqrt(2 * ln 2) * sigma ≈ 2.355 * a.
+        fwhm_est = 2.0 * np.sqrt(2.0 * np.log(2.0)) * float(obj["a"])
         a_val = max(float(obj["a"]), 1e-6)
         b_val = max(float(obj["b"]), 1e-6)
         elongation = a_val / b_val
