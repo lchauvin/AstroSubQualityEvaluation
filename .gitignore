@@ -44,9 +44,14 @@ Thumbs.db
 # Claude Code
 .claude/
 
-# Generated reports (project-specific)
+# Secrets
+.env
+*.env.local
+
+# Generated reports and analysis output (project-specific)
 astro_eval_report.csv
 astro_eval_report.html
+astro_eval_analysis.txt
 
 # Astronomy data files — large, not source-controlled
 *.fits

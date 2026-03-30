@@ -62,6 +62,8 @@ class EvalConfig:
 
     Passed through the entire pipeline so every module uses consistent settings.
     """
+    bortle: int = 0
+
     focal_length_mm: float = 250.0
 
     # Star detection

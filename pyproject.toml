@@ -16,6 +16,7 @@ dependencies = [
     "xisf>=0.9",
     "paramiko>=3.0",
     "tomli>=1.2; python_version < '3.11'",
+    "openai>=2.30.0",
 ]
 
 [project.optional-dependencies]

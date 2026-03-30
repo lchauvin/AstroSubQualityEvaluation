@@ -11,6 +11,9 @@ Search order for the config file:
 
 Example config (all fields optional):
 
+    [sky]
+    bortle = 9
+
     [telescope]
     focal_length_mm = 250.0
 

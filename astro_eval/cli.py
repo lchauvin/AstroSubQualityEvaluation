@@ -284,6 +284,8 @@ Examples:
                         help="Evaluation mode. Default: auto (detect from FILTER header).")
     parser.add_argument("--output", metavar="OUTPUT_DIR", default=None,
                         help="Output directory for reports. Default: same as INPUT_DIR.")
+    parser.add_argument("--bortle", type=int, default=0,
+                        help="Bortle sky. Default: 0.")
     parser.add_argument("--focal-length", type=float, default=250.0, metavar="MM",
                         help="Telescope focal length in mm. Default: 250.")
     parser.add_argument("--fwhm-threshold", type=float, default=5.0, metavar="ARCSEC",
@@ -977,6 +979,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Sentinel defaults — only apply config value when the CLI arg was not explicitly set
     _CLI_DEFAULTS = {
+        "bortle": 0,
         "focal_length": 250.0, "fwhm_threshold": 5.0, "ecc_threshold": 0.5,
         "star_fraction": 0.7,  "snr_fraction": 0.5,   "sigma_fwhm": 2.0,
         "sigma_noise": 2.5,    "sigma_bg": 3.0,        "sigma_residual": 3.0,
@@ -989,6 +992,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "serve": False,        "port": 7420,           "verbose": False,
     }
     _CFG_MAP = {
+        "bortle":             "sky.bortle",
         "focal_length":       "telescope.focal_length_mm",
         "fwhm_threshold":     "rejection.fwhm_threshold_arcsec",
         "ecc_threshold":      "rejection.ecc_threshold",
@@ -1133,6 +1137,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Build config
     # -----------------------------------------------------------------------
     config = EvalConfig(
+        bortle=args.bortle,
         focal_length_mm=args.focal_length,
         detection_threshold=args.detection_threshold,
         fwhm_threshold_arcsec=args.fwhm_threshold,

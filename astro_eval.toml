@@ -7,6 +7,13 @@
 # CLI arguments always override values set here.
 
 # ---------------------------------------------------------------------------
+# Sky
+# ---------------------------------------------------------------------------
+
+[sky]
+bortle = 9                       # Sky Bortle
+
+# ---------------------------------------------------------------------------
 # Telescope
 # ---------------------------------------------------------------------------
 
@@ -95,3 +102,14 @@ html    = false
 serve   = false
 port    = 7420
 verbose = false
+
+[analysis]
+# LLM-powered session diagnosis — only runs when --analysis is passed.
+# Model format: "provider/model-id"
+#   Supported providers: anthropic | openai | ollama
+# model      = "anthropic/claude-haiku-4-5-20251001"
+# model    = "anthropic/claude-sonnet-4-6"
+# model    = "openai/gpt-4o-mini"
+model    = "ollama/nemotron-3-nano:30b-cloud"
+ollama_url = "http://localhost:11434"   # only relevant for ollama provider
+max_tokens = 1500
